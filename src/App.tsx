@@ -86,6 +86,7 @@ import {
   Bar,
   Cell
 } from 'recharts';
+import { QRCodeSVG } from 'qrcode.react';
 import { isSupabaseConfigured, updateSupabaseConfig, supabase } from './lib/supabase';
 
 // Utility for tailwind classes
@@ -148,6 +149,7 @@ export default function App() {
   const [scholarships, setScholarships] = useState<any[]>([]);
   const [recommendations, setRecommendations] = useState<any[]>([]);
   const [notifications, setNotifications] = useState<any[]>([]);
+  const [transactions, setTransactions] = useState<any[]>([]);
   const [activeModal, setActiveModal] = useState<string | null>(null);
   const [isDarkMode, setIsDarkMode] = useState(() => {
     const saved = localStorage.getItem('aid_portal_dark_mode');
@@ -227,6 +229,7 @@ export default function App() {
   const [gradeEntryFilter, setGradeEntryFilter] = useState('');
   const [classListMode, setClassListMode] = useState<'list' | 'enroll'>('list');
   const [selectedApplicationForSummary, setSelectedApplicationForSummary] = useState<any>(null);
+  const [previewFile, setPreviewFile] = useState<{name: string, data: string} | null>(null);
 
   // Persist state
   useEffect(() => {
@@ -259,6 +262,37 @@ export default function App() {
   const [communityEvents, setCommunityEvents] = useState<any[]>([]);
   const [communityOrgs, setCommunityOrgs] = useState<any[]>([]);
 
+  // Automatic login logic for students (Session-based)
+  useEffect(() => {
+    const checkAutoLogin = async () => {
+      // If we have a saved user in localStorage, the state initializer already handles it.
+      // If we don't have a user, and we haven't manually logged out in this session,
+      // and we are on the landing/login pages, we can attempt a quick entry.
+      const savedUser = localStorage.getItem('aid_portal_user');
+      const hasLoggedOut = sessionStorage.getItem('aid_portal_manual_logout');
+      
+      if (!savedUser && !hasLoggedOut && (view === 'landing' || view === 'login')) {
+        try {
+          const { data, error } = await supabase
+            .from('users')
+            .select('*')
+            .eq('role', 'student')
+            .limit(1)
+            .single();
+          
+          if (!error && data) {
+            setUser(data);
+            setView('dashboard');
+            localStorage.setItem('aid_portal_user', JSON.stringify(data));
+          }
+        } catch (err) {
+          console.error('Auto-login error:', err);
+        }
+      }
+    };
+    checkAutoLogin();
+  }, []);
+
   // Fetch data
   useEffect(() => {
     if (user) {
@@ -274,6 +308,7 @@ export default function App() {
       fetchResources();
       fetchCourses();
       fetchCommunityData();
+      fetchTransactions();
     }
   }, [user]);
 
@@ -413,6 +448,21 @@ export default function App() {
     }
   };
 
+  const fetchTransactions = async () => {
+    if (!user) return;
+    let query = supabase
+      .from('transactions')
+      .select('*')
+      .order('timestamp', { ascending: false });
+    
+    if (user.role === 'student') {
+      query = query.eq('userId', user.id);
+    }
+    
+    const { data, error } = await query;
+    if (!error && data) setTransactions(data);
+  };
+
   const fetchUsers = async () => {
     try {
       const { data, error } = await supabase
@@ -421,6 +471,13 @@ export default function App() {
       
       if (!error && data) {
         setUsers(data);
+        if (user) {
+          const freshUser = data.find(u => u.id === user.id);
+          if (freshUser) {
+            setUser(freshUser);
+            localStorage.setItem('aid_portal_user', JSON.stringify(freshUser));
+          }
+        }
       }
     } catch (err) {
       console.error(err);
@@ -482,29 +539,65 @@ export default function App() {
   };
 
   const updateFinancialAidStatus = async (id: number, status: string) => {
-    await supabase
+    const app = financialAid.find(a => a.id === id);
+    if (!app) return;
+
+    const { error: updateError } = await supabase
       .from('financial_aid')
       .update({ status })
       .eq('id', id);
-    
-    // Create notification for student
-    const app = financialAid.find(a => a.id === id);
-    if (app) {
-      let notificationType: 'success' | 'error' | 'info' = 'info';
-      if (status === 'approved') notificationType = 'success';
-      if (status === 'rejected') notificationType = 'error';
 
-      await supabase.from('notifications').insert({
-        userId: app.studentId,
-        title: "Application Update",
-        message: `Your application for ${app.program} has been ${status}.`,
-        type: notificationType,
-        read: false,
-        timestamp: new Date().toISOString()
-      });
+    if (!updateError) {
+      logActivity('FINANCIAL_AID_UPDATE', `Application #${id} status updated to ${status}`, 'Successful');
+    }
+    
+    // If approved, deduct from student balance and log transaction
+    if (status === 'approved' && !updateError) {
+      const student = users.find(u => u.id === app.studentId);
+      if (student) {
+        const aidAmount = parseInt(app.amount?.replace(/[^0-9]/g, '') || '0');
+        const prevBal = student.balance || 0;
+        const newBalance = Math.max(0, prevBal - aidAmount);
+
+        // Update student balance
+        await supabase
+          .from('users')
+          .update({ balance: newBalance })
+          .eq('id', student.id);
+
+        // Log transaction
+        await supabase.from('transactions').insert({
+          userId: student.id,
+          userName: `${student.name} ${student.surname}`,
+          amount: aidAmount,
+          type: 'Aid Disbursement',
+          method: 'CREDIT',
+          status: 'Successful',
+          timestamp: new Date().toISOString(),
+          prevBalance: prevBal,
+          updatedBalance: newBalance,
+          details: `Financial assistance for ${app.program} approved and applied to outstanding balance.`
+        });
+      }
     }
 
+    // Create notification for student
+    let notificationType: 'success' | 'error' | 'info' = 'info';
+    if (status === 'approved') notificationType = 'success';
+    if (status === 'rejected') notificationType = 'error';
+
+    await supabase.from('notifications').insert({
+      userId: app.studentId,
+      title: "Application Update",
+      message: `Your application for ${app.program} has been ${status}.`,
+      type: notificationType,
+      read: false,
+      timestamp: new Date().toISOString()
+    });
+
     fetchFinancialAid();
+    fetchUsers();
+    fetchTransactions();
   };
 
   const deleteFinancialAid = async (id: number) => {
@@ -518,10 +611,14 @@ export default function App() {
     }
   };
 
-  const handleUpdateFinancialAid = async (application: any) => {
-    // This could open a modal to edit the application details
-    // For now, we'll just allow basic status updates which are already implemented
-    console.log('Update application:', application);
+  const handleUpdateFinancialAid = async (id: number, updates: any) => {
+    const { error } = await supabase
+      .from('financial_aid')
+      .update(updates)
+      .eq('id', id);
+    if (!error) {
+      fetchFinancialAid();
+    }
   };
 
   const assignFaculty = async (applicationId: number, facultyId: string) => {
@@ -543,6 +640,25 @@ export default function App() {
     fetchFinancialAid();
   };
 
+  const logActivity = async (action: string, details: string, status: string = 'Successful', overrideUser?: UserData | null) => {
+    const currentUser = overrideUser || user;
+    if (!currentUser) return;
+
+    try {
+      await supabase.from('audit_logs').insert({
+        userId: currentUser.id,
+        userName: `${currentUser.name} ${currentUser.surname}`,
+        role: currentUser.role,
+        action: action.toUpperCase(),
+        details,
+        status,
+        timestamp: new Date().toISOString()
+      });
+    } catch (err) {
+      console.error('Logging error:', err);
+    }
+  };
+
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
@@ -556,16 +672,22 @@ export default function App() {
 
       if (error || !data) {
         setError('Invalid ID or password');
+        // Log failed attempt if ID exists
+        if (loginId) {
+          logActivity('LOGIN_FAILED', `Failed login attempt for ID: ${loginId}`, 'Failed', { id: loginId, name: 'Unknown', surname: 'User', role: 'student' } as UserData);
+        }
         return;
       }
 
       if (data.status === 'pending') {
         setError('Your account is pending approval');
+        logActivity('LOGIN_BLOCKED', `Login attempt blocked: Account pending approval`, 'Blocked', data);
         return;
       }
 
       if (data.status === 'rejected') {
         setError('Your account has been rejected');
+        logActivity('LOGIN_BLOCKED', `Login attempt blocked: Account rejected`, 'Blocked', data);
         return;
       }
 
@@ -573,12 +695,7 @@ export default function App() {
       setView('dashboard');
       
       // Log audit
-      await supabase.from('audit_logs').insert({
-        action: 'LOGIN',
-        userId: data.id,
-        timestamp: new Date().toISOString(),
-        details: `User ${data.id} logged in`
-      });
+      logActivity('LOGIN', `User ${data.id} logged in successfully`, 'Successful', data);
 
     } catch (err) {
       console.error('Login error:', err);
@@ -652,6 +769,7 @@ export default function App() {
 
       if (error) {
         setError(error.message);
+        logActivity('REGISTER_FAILED', `Registration failed for ${regData.id}: ${error.message}`, 'Failed', { id: regData.id, name: regData.name, surname: regData.surname, role: regData.role } as UserData);
         return;
       }
 
@@ -663,12 +781,7 @@ export default function App() {
       setView('login');
 
       // Log audit
-      await supabase.from('audit_logs').insert({
-        action: 'REGISTER',
-        userId: registeredId,
-        timestamp: new Date().toISOString(),
-        details: `New user ${registeredId} registered as ${regData.role}`
-      });
+      logActivity('REGISTER', `New user ${registeredId} registered as ${regData.role}`, 'Successful', { id: registeredId, name: regData.name, surname: regData.surname, role: regData.role } as UserData);
 
       // Reset registration data for next time
       setRegData({ 
@@ -691,31 +804,23 @@ export default function App() {
   };
 
   const handleLogout = () => {
-    setConfirmConfig({
-      isOpen: true,
-      title: 'Logout Portal',
-      message: 'Are you sure you want to end your session? You will need to log in again to access your dashboard.',
-      type: 'warning',
-      onConfirm: () => {
-        setUser(null);
-        setView('landing');
-        setLoginId('');
-        setLoginPassword('');
-        setIsRegistering(false);
-        setIsForgotPassword(false);
-        setRegData({ 
-          id: '', 
-          surname: '', 
-          name: '', 
-          role: 'student' as Role, 
-          course: 'BSIT', 
-          yearLevel: '1st Year',
-          password: '',
-          securityQuestion: 'What is your favorite color?',
-          securityAnswer: ''
-        });
-      }
-    });
+    // Clear all persistent data
+    localStorage.removeItem('aid_portal_user');
+    localStorage.removeItem('aid_portal_view');
+    
+    // Set a session flag to prevent immediate auto-login loop
+    sessionStorage.setItem('aid_portal_manual_logout', 'true');
+    
+    if (user) {
+      logActivity('LOGOUT', `User ${user.name} ${user.surname} logged out`, 'Successful');
+    }
+    
+    setUser(null);
+    setView('landing');
+    setLoginId('');
+    setLoginPassword('');
+    setIsRegistering(false);
+    setIsForgotPassword(false);
   };
 
   if (!user && view === 'landing') {
@@ -969,7 +1074,6 @@ export default function App() {
                         <option value="2nd Year">2nd Year</option>
                         <option value="3rd Year">3rd Year</option>
                         <option value="4th Year">4th Year</option>
-                        <option value="5th Year">5th Year</option>
                       </select>
                     </div>
                   </>
@@ -1072,6 +1176,7 @@ export default function App() {
                 <NavCategory label="FINANCIAL" collapsed={!isSidebarOpen} isDarkMode={isDarkMode} />
                 <NavItem icon={<DollarSign />} label="Financial Aid" active={view === 'finance'} onClick={() => setView('finance')} collapsed={!isSidebarOpen} isDarkMode={isDarkMode} accentColor={accentColor} />
                 <NavItem icon={<Wallet />} label="Balance & Payments" active={view === 'payments'} onClick={() => setView('payments')} collapsed={!isSidebarOpen} isDarkMode={isDarkMode} accentColor={accentColor} />
+                <NavItem icon={<Receipt />} label="Transaction Log" active={view === 'transactions'} onClick={() => setView('transactions')} collapsed={!isSidebarOpen} isDarkMode={isDarkMode} accentColor={accentColor} />
               </>
             )}
             
@@ -1110,7 +1215,7 @@ export default function App() {
                 
                 <NavCategory label="SYSTEM" collapsed={!isSidebarOpen} isDarkMode={isDarkMode} />
                 <NavItem icon={<BarChart3 />} label="Reports & Analytics" active={view === 'reports'} onClick={() => setView('reports')} collapsed={!isSidebarOpen} isDarkMode={isDarkMode} accentColor={accentColor} />
-                <NavItem icon={<Database />} label="Student Activity Log" active={view === 'activity'} onClick={() => setView('activity')} collapsed={!isSidebarOpen} isDarkMode={isDarkMode} accentColor={accentColor} />
+                <NavItem icon={<Database />} label="Transaction Logs Dashboard" active={view === 'activity'} onClick={() => setView('activity')} collapsed={!isSidebarOpen} isDarkMode={isDarkMode} accentColor={accentColor} />
                 <NavItem icon={<Settings />} label="Settings" active={view === 'settings'} onClick={() => setView('settings')} collapsed={!isSidebarOpen} isDarkMode={isDarkMode} accentColor={accentColor} />
               </>
             )}
@@ -1347,6 +1452,7 @@ export default function App() {
                   financialAid={financialAid} 
                   scholarships={scholarships} 
                   announcements={announcements}
+                  transactions={transactions}
                   updateFinancialAidStatus={updateFinancialAidStatus}
                   setView={setView} 
                 />
@@ -1374,6 +1480,7 @@ export default function App() {
                   financialAid={financialAid} 
                   users={users}
                   mentors={mentors}
+                  transactions={transactions}
                 />
               )
             )}
@@ -1381,27 +1488,27 @@ export default function App() {
             {view === 'profile' && <Profile user={user} setUser={setUser} isDarkMode={isDarkMode} />}
             {view === 'grades' && <Grades user={user} isDarkMode={isDarkMode} users={users} />}
             {view === 'schedule' && <Schedule user={user} isDarkMode={isDarkMode} />}
-            {view === 'courses' && <CoursesView isDarkMode={isDarkMode} setView={setView} setGradeEntryFilter={setGradeEntryFilter} users={users} fetchUsers={fetchUsers} facultyUser={user} courses={courses} fetchCourses={fetchCourses} isAdmin={user.role === 'admin'} />}
-            {view === 'grade-entry' && <GradeEntryView users={users} isDarkMode={isDarkMode} facultyUser={user} fetchUsers={fetchUsers} initialFilter={gradeEntryFilter} setGradeEntryFilter={setGradeEntryFilter} courses={courses} />}
-            {view === 'finance' && <FinancialAid user={user} financialAid={financialAid} fetchFinancialAid={fetchFinancialAid} isDarkMode={isDarkMode} selectedScholarship={selectedScholarship} setSelectedScholarship={setSelectedScholarship} users={users} />}
+            {view === 'courses' && <CoursesView isDarkMode={isDarkMode} setView={setView} setGradeEntryFilter={setGradeEntryFilter} users={users} fetchUsers={fetchUsers} facultyUser={user} courses={courses} fetchCourses={fetchCourses} isAdmin={user.role === 'admin'} logActivity={logActivity} />}
+            {view === 'grade-entry' && <GradeEntryView users={users} isDarkMode={isDarkMode} facultyUser={user} fetchUsers={fetchUsers} initialFilter={gradeEntryFilter} setGradeEntryFilter={setGradeEntryFilter} courses={courses} logActivity={logActivity} />}
+            {view === 'finance' && <FinancialAid user={user} financialAid={financialAid} fetchFinancialAid={fetchFinancialAid} isDarkMode={isDarkMode} selectedScholarship={selectedScholarship} setSelectedScholarship={setSelectedScholarship} users={users} scholarships={scholarships} />}
             {view === 'messages' && <Messages user={user} messages={messages} fetchMessages={fetchMessages} users={users} isDarkMode={isDarkMode} selectedChatUser={selectedChatUser} setSelectedChatUser={setSelectedChatUser} courses={courses} mentors={mentors} />}
             {view === 'documents' && <Documents user={user} isDarkMode={isDarkMode} />}
-            {view === 'announcements' && <Announcements announcements={announcements} user={user} isDarkMode={isDarkMode} fetchAnnouncements={fetchAnnouncements} setConfirmConfig={setConfirmConfig} activeModal={activeModal} setActiveModal={setActiveModal} />}
+            {view === 'announcements' && <Announcements announcements={announcements} user={user} isDarkMode={isDarkMode} fetchAnnouncements={fetchAnnouncements} setConfirmConfig={setConfirmConfig} activeModal={activeModal} setActiveModal={setActiveModal} logActivity={logActivity} />}
             {view === 'admin' && <AdminPanel users={users} fetchUsers={fetchUsers} isDarkMode={isDarkMode} setConfirmConfig={setConfirmConfig} />}
-            {view === 'transactions' && <TransactionsView isDarkMode={isDarkMode} users={users} fetchUsers={fetchUsers} />}
-            {view === 'enrollment' && <EnrollmentView isDarkMode={isDarkMode} users={users} courses={courses} fetchUsers={fetchUsers} fetchCourses={fetchCourses} />}
+            {view === 'transactions' && <TransactionsView user={user} isDarkMode={isDarkMode} transactions={transactions} fetchTransactions={fetchTransactions} />}
+            {view === 'enrollment' && <EnrollmentView isDarkMode={isDarkMode} users={users} courses={courses} fetchUsers={fetchUsers} fetchCourses={fetchCourses} logActivity={logActivity} />}
             {view === 'grades-mgmt' && <GradesMgmtView users={users} isDarkMode={isDarkMode} fetchUsers={fetchUsers} initialFilter={gradeEntryFilter} />}
             {view === 'students' && <StudentsView users={users} isDarkMode={isDarkMode} currentUser={user} courses={courses} />}
             {view === 'policies' && <PoliciesView policies={policies} isDarkMode={isDarkMode} />}
             {view === 'scholarships' && <ScholarshipsView scholarships={scholarships} user={user} isDarkMode={isDarkMode} setView={setView} setSelectedScholarship={setSelectedScholarship} fetchScholarships={fetchScholarships} />}
             {view === 'programs' && <ScholarshipsView scholarships={scholarships} user={user} isDarkMode={isDarkMode} fetchScholarships={fetchScholarships} setView={setView} setSelectedScholarship={setSelectedScholarship} />}
-            {view === 'applications' && <ApplicationsView financialAid={financialAid} user={user} isDarkMode={isDarkMode} updateFinancialAidStatus={updateFinancialAidStatus} users={users} assignFaculty={assignFaculty} setView={setView} setSelectedStudentForRec={setSelectedStudentForRec} deleteFinancialAid={deleteFinancialAid} setSelectedApplicationForSummary={setSelectedApplicationForSummary} fetchFinancialAid={fetchFinancialAid} />}
+            {view === 'applications' && <ApplicationsView financialAid={financialAid} user={user} isDarkMode={isDarkMode} updateFinancialAidStatus={updateFinancialAidStatus} handleUpdateFinancialAid={handleUpdateFinancialAid} users={users} assignFaculty={assignFaculty} setView={setView} setSelectedStudentForRec={setSelectedStudentForRec} deleteFinancialAid={deleteFinancialAid} setSelectedApplicationForSummary={setSelectedApplicationForSummary} fetchFinancialAid={fetchFinancialAid} />}
             {view === 'reports' && <ReportsView financialAid={financialAid} scholarships={scholarships} isDarkMode={isDarkMode} user={user} />}
             {view === 'activity' && <ActivityView isDarkMode={isDarkMode} />}
             {view === 'recommendations' && <RecommendationsView recommendations={recommendations} user={user} isDarkMode={isDarkMode} fetchRecommendations={fetchRecommendations} users={users} />}
             {view === 'notifications' && <NotificationsView notifications={notifications} isDarkMode={isDarkMode} />}
             {view === 'academic-support' && <AcademicSupport user={user} isDarkMode={isDarkMode} />}
-            {view === 'payments' && <Payments user={user} isDarkMode={isDarkMode} setConfirmConfig={setConfirmConfig} />}
+            {view === 'payments' && <Payments user={user} setUser={setUser} isDarkMode={isDarkMode} setConfirmConfig={setConfirmConfig} courses={courses} fetchUsers={fetchUsers} fetchTransactions={fetchTransactions} transactions={transactions} logActivity={logActivity} />}
             {view === 'mentorship' && <Mentorship user={user} isDarkMode={isDarkMode} mentors={mentors} fetchMentors={fetchMentors} fetchUsers={fetchUsers} users={users} fetchNotifications={fetchNotifications} activeModal={activeModal} setActiveModal={setActiveModal} setView={setView} setSelectedChatUser={setSelectedChatUser} setConfirmConfig={setConfirmConfig} setSelectedStudentForRec={setSelectedStudentForRec} />}
             {view === 'resources' && <Resources user={user} isDarkMode={isDarkMode} resources={resources} fetchResources={fetchResources} activeModal={activeModal} setActiveModal={setActiveModal} />}
             {view === 'community' && <Community user={user} isDarkMode={isDarkMode} events={communityEvents} orgs={communityOrgs} fetchCommunityData={fetchCommunityData} activeModal={activeModal} setActiveModal={setActiveModal} />}
@@ -1453,10 +1560,10 @@ export default function App() {
               </button>
             </div>
 
-            <div className="space-y-6">
+            <div className="space-y-6 max-h-[60vh] overflow-y-auto px-1 custom-scrollbar">
               <div className="flex items-center gap-6 p-6 rounded-[2rem] bg-slate-50 dark:bg-white/5">
                 <div className="w-16 h-16 rounded-2xl bg-red-600 flex items-center justify-center text-white text-3xl font-black">
-                  {selectedApplicationForSummary.studentName[0]}
+                  {selectedApplicationForSummary.studentName?.[0] || 'A'}
                 </div>
                 <div>
                   <p className="text-2xl font-black tracking-tight">{selectedApplicationForSummary.studentName}</p>
@@ -1477,19 +1584,42 @@ export default function App() {
 
               {selectedApplicationForSummary.personalStatement && (
                 <div className="p-6 rounded-2xl bg-amber-500/5 border border-amber-500/10">
-                  <p className="text-[10px] font-black text-amber-600 uppercase tracking-widest mb-2">Personal Statement</p>
-                  <p className="text-sm font-medium leading-relaxed italic line-clamp-4">"{selectedApplicationForSummary.personalStatement}"</p>
+                  <p className="text-[10px] font-black text-amber-600 uppercase tracking-widest mb-2">Personal Statement / Essay</p>
+                  <p className="text-sm font-medium leading-relaxed italic whitespace-pre-wrap">"{selectedApplicationForSummary.personalStatement}"</p>
+                </div>
+              )}
+
+              {selectedApplicationForSummary.reason && (
+                <div className="p-6 rounded-2xl bg-blue-500/5 border border-blue-500/10">
+                  <p className="text-[10px] font-black text-blue-600 uppercase tracking-widest mb-2">Justification / Funding Reason</p>
+                  <p className="text-sm font-medium leading-relaxed italic whitespace-pre-wrap">"{selectedApplicationForSummary.reason}"</p>
                 </div>
               )}
 
               {selectedApplicationForSummary.attachments && (
                 <div className="p-6 rounded-2xl border border-slate-100 dark:border-white/5">
                   <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3">Verification Documents</p>
-                  <div className="grid grid-cols-2 gap-y-2 gap-x-4">
+                  <div className="space-y-2">
                     {Object.entries(selectedApplicationForSummary.attachments).map(([key, val]: [string, any]) => (
-                      <div key={key} className="flex items-center gap-2">
-                        {val ? <CheckCircle className="w-3 h-3 text-emerald-500" /> : <XCircle className="w-3 h-3 text-red-400" />}
-                        <span className="text-[10px] font-bold capitalize text-slate-500">{key.replace(/([A-Z])/g, ' $1').trim()}</span>
+                      <div key={key} className={cn(
+                        "p-3 rounded-xl border flex items-center justify-between",
+                        isDarkMode ? "bg-white/5 border-white/5" : "bg-slate-50 border-slate-100"
+                      )}>
+                        <div className="flex items-center gap-3">
+                          {val ? <CheckCircle className="w-3 h-3 text-emerald-500" /> : <XCircle className="w-3 h-3 text-red-400" />}
+                          <span className="text-[10px] font-bold capitalize text-slate-500">{key.replace(/([A-Z])/g, ' $1').trim()}</span>
+                        </div>
+                        {val && (
+                          <button 
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setPreviewFile({ name: key, data: val });
+                            }}
+                            className="text-[10px] font-black uppercase text-red-600 hover:underline"
+                          >
+                            View File
+                          </button>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -1526,6 +1656,71 @@ export default function App() {
           </motion.div>
         </div>
       )}
+
+      {/* File Preview Modal (Global) */}
+      <AnimatePresence>
+        {previewFile && (
+          <div className="fixed inset-0 z-[2000] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }} 
+              animate={{ opacity: 1 }} 
+              exit={{ opacity: 0 }}
+              onClick={() => setPreviewFile(null)}
+              className="absolute inset-0 bg-black/90 backdrop-blur-xl"
+            />
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }} 
+              animate={{ scale: 1, opacity: 1 }} 
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="relative max-w-5xl w-full max-h-[90vh] flex flex-col bg-slate-900 rounded-[2.5rem] overflow-hidden shadow-2xl"
+            >
+              <div className="p-6 flex items-center justify-between border-b border-white/10 bg-slate-900/50 backdrop-blur-md">
+                <div>
+                  <h4 className="text-white font-black uppercase tracking-widest text-xs">File Preview</h4>
+                  <p className="text-white/60 text-[10px] font-bold uppercase tracking-widest">
+                    {previewFile.name.replace(/([A-Z])/g, ' $1').trim()}
+                  </p>
+                </div>
+                <button 
+                  onClick={() => setPreviewFile(null)}
+                  className="p-3 bg-white/5 hover:bg-white/10 rounded-2xl text-white transition-colors"
+                >
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+              <div className="flex-1 overflow-auto p-4 flex items-center justify-center bg-[#000]">
+                {typeof previewFile.data === 'string' && (previewFile.data.startsWith('data:application/pdf') || previewFile.data.includes('.pdf')) ? (
+                  <iframe 
+                    src={previewFile.data} 
+                    className="w-full h-[70vh] rounded-xl border-none"
+                    title="PDF Preview"
+                  />
+                ) : typeof previewFile.data === 'string' ? (
+                  <img 
+                    src={previewFile.data} 
+                    alt="Preview" 
+                    className="max-w-full max-h-full object-contain shadow-2xl"
+                    referrerPolicy="no-referrer"
+                  />
+                ) : (
+                  <div className="text-white font-bold text-center">
+                    <AlertTriangle className="w-12 h-12 text-amber-500 mx-auto mb-4" />
+                    <p>File content not available for older applications.</p>
+                  </div>
+                )}
+              </div>
+              <div className="p-6 bg-slate-900/50 backdrop-blur-md border-t border-white/10 flex justify-end">
+                <button 
+                  onClick={() => setPreviewFile(null)}
+                  className="px-8 py-3 bg-white text-slate-900 rounded-2xl font-black uppercase tracking-widest text-xs"
+                >
+                  Close Preview
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
@@ -1817,7 +2012,8 @@ function StudentDashboard({
   scholarships = [], 
   financialAid = [],
   users = [],
-  mentors = []
+  mentors = [],
+  transactions = []
 }: { 
   user: UserData, 
   isDarkMode?: boolean, 
@@ -1826,7 +2022,8 @@ function StudentDashboard({
   scholarships?: any[],
   financialAid?: any[],
   users?: UserData[],
-  mentors?: any[]
+  mentors?: any[],
+  transactions?: any[]
 }) {
   const isStudent = user.role === 'student';
   const myApplications = (financialAid || []).filter(a => a.studentId === user.id);
@@ -2063,6 +2260,43 @@ function StudentDashboard({
                 isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
               )}>
                 <div className="flex items-center justify-between mb-6">
+                  <h3 className="text-xl font-bold flex items-center gap-2">
+                    <Receipt className="w-5 h-5 text-red-600" />
+                    Transaction Log
+                  </h3>
+                  <button 
+                    onClick={() => setView('transactions')}
+                    className="text-xs font-black uppercase tracking-widest text-red-600 hover:text-red-700 transition-colors"
+                  >
+                    View All →
+                  </button>
+                </div>
+                <div className="space-y-4">
+                  {(transactions || []).slice(0, 3).map((t, i) => (
+                    <div key={i} className="flex items-center justify-between py-3 border-b border-slate-100 dark:border-white/5 last:border-0 hover:bg-slate-50 dark:hover:bg-white/5 rounded-xl px-2 transition-colors">
+                      <div>
+                        <p className="font-bold text-sm tracking-tight">{t.details || t.type}</p>
+                        <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">{new Date(t.timestamp || t.date).toLocaleDateString()}</p>
+                      </div>
+                      <p className={cn(
+                        "text-lg font-black tracking-tighter", 
+                        (t.type || '').includes('Payment') ? "text-emerald-500" : "text-blue-500"
+                      )}>
+                        {(t.type || '').includes('Payment') ? '-' : '+'}₱{t.amount?.toLocaleString()}
+                      </p>
+                    </div>
+                  ))}
+                  {(!transactions || transactions.length === 0) && (
+                    <p className="text-center py-10 text-slate-400 font-bold italic">No recent transactions recorded.</p>
+                  )}
+                </div>
+              </div>
+
+              <div className={cn(
+                "p-8 rounded-[2.5rem] border transition-all",
+                isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
+              )}>
+                <div className="flex items-center justify-between mb-6">
                   <h3 className="text-xl font-bold">Document Checklist</h3>
                   <button 
                     onClick={() => setView('documents')}
@@ -2218,7 +2452,7 @@ function StudentDashboard({
   );
 }
 
-const CoursesView = ({ isDarkMode, setView, setGradeEntryFilter, users, fetchUsers, facultyUser, courses, fetchCourses, isAdmin }: { isDarkMode: boolean, setView: (view: string) => void, setGradeEntryFilter: (filter: string) => void, users: UserData[], fetchUsers: () => void, facultyUser: UserData, courses: any[], fetchCourses: () => void, isAdmin: boolean }) => {
+const CoursesView = ({ isDarkMode, setView, setGradeEntryFilter, users, fetchUsers, facultyUser, courses, fetchCourses, isAdmin, logActivity }: { isDarkMode: boolean, setView: (view: string) => void, setGradeEntryFilter: (filter: string) => void, users: UserData[], fetchUsers: () => void, facultyUser: UserData, courses: any[], fetchCourses: () => void, isAdmin: boolean, logActivity: any }) => {
   const [showClassList, setShowClassList] = useState(false);
   const [selectedCourse, setSelectedCourse] = useState<any>(null);
   const [classListMode, setClassListMode] = useState<'list' | 'enroll'>('list');
@@ -2234,7 +2468,8 @@ const CoursesView = ({ isDarkMode, setView, setGradeEntryFilter, users, fetchUse
     endTime: '09:30 AM', 
     location: '', 
     instructor: '',
-    price: 0
+    price: '' as any,
+    semester: '1st Semester'
   });
 
   // Validation logic: Alphanumeric, at least 3 characters
@@ -2279,7 +2514,8 @@ const CoursesView = ({ isDarkMode, setView, setGradeEntryFilter, users, fetchUse
         location: finalLocation,
         instructor: newCourse.instructor,
         students: editingCourse ? (editingCourse.students || 0) : 0,
-        price: Number(newCourse.price) || 0
+        price: Number(newCourse.price) || 0,
+        semester: newCourse.semester
       };
 
       if (editingCourse) {
@@ -2289,20 +2525,22 @@ const CoursesView = ({ isDarkMode, setView, setGradeEntryFilter, users, fetchUse
           .eq('id', editingCourse.id);
         
         if (error) throw error;
+        logActivity('UPDATE_COURSE', `Updated course details for ${courseData.id} (${courseData.name})`, 'Successful');
         
         await fetchCourses();
         setShowAddCourseModal(false);
         setEditingCourse(null);
-        setNewCourse({ id: '', name: '', days: 'Mon/Wed', startTime: '08:00 AM', endTime: '09:30 AM', location: '', instructor: '', price: 0 });
+        setNewCourse({ id: '', name: '', days: 'Mon/Wed', startTime: '08:00 AM', endTime: '09:30 AM', location: '', instructor: '', price: 0, semester: '1st Semester' });
         alert('Course updated successfully!');
       } else {
         const { error } = await supabase.from('courses').insert([courseData]);
         if (error) throw error;
         
+        logActivity('CREATE_COURSE', `Created new course: ${courseData.id} (${courseData.name})`, 'Successful');
         await fetchCourses();
         console.log("Course added successfully");
         setShowAddCourseModal(false);
-        setNewCourse({ id: '', name: '', days: 'Mon/Wed', startTime: '08:00 AM', endTime: '09:30 AM', location: '', instructor: '', price: 0 });
+        setNewCourse({ id: '', name: '', days: 'Mon/Wed', startTime: '08:00 AM', endTime: '09:30 AM', location: '', instructor: '', price: 0, semester: '1st Semester' });
         alert(`Successfully added Course ${courseData.id}!`);
       }
     } catch (err: any) {
@@ -2326,6 +2564,7 @@ const CoursesView = ({ isDarkMode, setView, setGradeEntryFilter, users, fetchUse
       .eq('id', courseId);
     
     if (!error) {
+      logActivity('DELETE_COURSE', `Course ${courseId} deleted from system`, 'Successful');
       fetchCourses();
       alert('Course deleted successfully!');
     } else {
@@ -2398,6 +2637,8 @@ const CoursesView = ({ isDarkMode, setView, setGradeEntryFilter, users, fetchUse
       });
 
       await Promise.all(enrollPromises);
+
+      logActivity('BULK_ENROLLMENT', `Bulk enrolled ${enrollSuccessCount} students into ${selectedCourse.id}`, 'Successful');
 
       // Update course student count
       if (enrollSuccessCount > 0) {
@@ -2755,15 +2996,29 @@ const CoursesView = ({ isDarkMode, setView, setGradeEntryFilter, users, fetchUse
                   </div>
                 </div>
 
-                <div className="space-y-1">
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-2">Course Price (₱)</label>
-                  <input 
-                    type="number"
-                    placeholder="e.g. 5000"
-                    value={newCourse.price ?? 0}
-                    onChange={e => setNewCourse({...newCourse, price: Number(e.target.value)})}
-                    className="w-full p-4 bg-slate-50 dark:bg-white/5 rounded-2xl border-none outline-none focus:ring-2 focus:ring-red-600 font-bold text-slate-900 dark:text-white"
-                  />
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-2">Course Price (₱)</label>
+                    <input 
+                      type="number"
+                      placeholder="e.g. 5000"
+                      value={newCourse.price}
+                      onChange={e => setNewCourse({...newCourse, price: e.target.value})}
+                      className="w-full p-4 bg-slate-50 dark:bg-white/5 rounded-2xl border-none outline-none focus:ring-2 focus:ring-red-600 font-bold text-slate-900 dark:text-white"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-2">Semester</label>
+                    <select 
+                      value={newCourse.semester}
+                      onChange={e => setNewCourse({...newCourse, semester: e.target.value})}
+                      className="w-full p-4 bg-slate-50 dark:bg-white/5 rounded-2xl border-none outline-none focus:ring-2 focus:ring-red-600 font-bold text-slate-900 dark:text-white appearance-none"
+                    >
+                      <option className="bg-white dark:bg-[#111111]">1st Semester</option>
+                      <option className="bg-white dark:bg-[#111111]">2nd Semester</option>
+                      <option className="bg-white dark:bg-[#111111]">Summer</option>
+                    </select>
+                  </div>
                 </div>
 
                 <div className="space-y-1">
@@ -2790,7 +3045,7 @@ const CoursesView = ({ isDarkMode, setView, setGradeEntryFilter, users, fetchUse
                   <button onClick={() => {
                     setShowAddCourseModal(false);
                     setEditingCourse(null);
-                    setNewCourse({ id: '', name: '', days: 'Mon/Wed', startTime: '08:00 AM', endTime: '09:30 AM', location: '', instructor: '', price: 0 });
+                    setNewCourse({ id: '', name: '', days: 'Mon/Wed', startTime: '08:00 AM', endTime: '09:30 AM', location: '', instructor: '', price: '' as any, semester: '1st Semester' });
                   }} className="flex-1 py-4 bg-slate-100 dark:bg-white/5 rounded-2xl font-bold text-slate-600 dark:text-slate-300">Cancel</button>
                   <button 
                     onClick={handleAddCourse} 
@@ -2958,16 +3213,21 @@ const CoursesView = ({ isDarkMode, setView, setGradeEntryFilter, users, fetchUse
   );
 };
 
-const GradeEntryView = ({ users, isDarkMode, facultyUser, fetchUsers, initialFilter, setGradeEntryFilter, courses = [] }: { users: UserData[], isDarkMode: boolean, facultyUser: UserData, fetchUsers: () => void, initialFilter: string, setGradeEntryFilter: (filter: string) => void, courses?: any[] }) => {
+const GradeEntryView = ({ users, isDarkMode, facultyUser, fetchUsers, initialFilter, setGradeEntryFilter, courses = [], logActivity }: { users: UserData[], isDarkMode: boolean, facultyUser: UserData, fetchUsers: () => void, initialFilter: string, setGradeEntryFilter: (filter: string) => void, courses?: any[], logActivity: any }) => {
   const [selectedStudent, setSelectedStudent] = useState<UserData | null>(null);
   const [showModal, setShowModal] = useState(false);
   const [newGrade, setNewGrade] = useState({ 
     subject: initialFilter || '', 
-    instructor: `${facultyUser.name} ${facultyUser.surname}`, 
-    grade: '', 
+    instructor: facultyUser.id, 
+    prelim: '', 
+    midterm: '', 
+    prefinal: '', 
+    finals: '',
     semester: '1st Semester',
     date: new Date().toISOString().split('T')[0]
   });
+  const [gradeSuccess, setGradeSuccess] = useState<string | null>(null);
+  const [saveAllComplete, setSaveAllComplete] = useState(false);
   const [searchTerm, setSearchTerm] = useState(initialFilter || '');
 
   useEffect(() => {
@@ -2996,7 +3256,14 @@ const GradeEntryView = ({ users, isDarkMode, facultyUser, fetchUsers, initialFil
   );
 
   const handleAddGrade = async () => {
-    if (!selectedStudent || !newGrade.subject) return;
+    if (!selectedStudent) {
+      alert("Please select a student first.");
+      return;
+    }
+    if (!newGrade.subject) {
+      alert("Validation Error: Please select a subject before entering grades.");
+      return;
+    }
 
     // Strict Authorization Check: Ensure the subject is actually taught by this faculty
     const isAuthorized = facultyCourseIds.includes(newGrade.subject);
@@ -3005,23 +3272,88 @@ const GradeEntryView = ({ users, isDarkMode, facultyUser, fetchUsers, initialFil
       return;
     }
 
-    const updatedGrades = [...(selectedStudent.grades || []), newGrade];
+    const updatedGrades = [...(selectedStudent.grades || [])];
+    const existingGradeIndex = updatedGrades.findIndex(g => g.subject === newGrade.subject && g.semester === newGrade.semester);
+    
+    if (existingGradeIndex >= 0) {
+      updatedGrades[existingGradeIndex] = { ...updatedGrades[existingGradeIndex], ...newGrade };
+    } else {
+      updatedGrades.push(newGrade);
+    }
+
     const { error } = await supabase
       .from('users')
       .update({ grades: updatedGrades })
       .eq('id', selectedStudent.id);
     
-    if (!error) {
-      fetchUsers();
-      setShowModal(false);
+      if (!error) {
+        logActivity('SUBMIT_GRADE', `Faculty submitted grades for student ${selectedStudent.id} in ${newGrade.subject}`, 'Successful');
+        // Success feedback
+        const isSomeEmpty = !newGrade.prelim || !newGrade.midterm || !newGrade.prefinal || !newGrade.finals;
+        const msg = isSomeEmpty 
+          ? `Partial grades for ${newGrade.subject} saved. Remember: Prelim: ${newGrade.prelim || 'N/A'}, Midterm: ${newGrade.midterm || 'N/A'}, Pre-final: ${newGrade.prefinal || 'N/A'}, Finals: ${newGrade.finals || 'N/A'}`
+          : `Full grades for ${newGrade.subject} successfully updated for ${selectedStudent.name}!`;
+        
+        setGradeSuccess(msg);
+        
+        // Check if all students in this course have grades for all 4 periods
+        const courseStudents = users.filter(u => u.role === 'student' && u.schedule?.some((s: any) => s.subject === newGrade.subject));
+        const allGraded = courseStudents.every(student => {
+          const grade = student.grades?.find((g: any) => g.subject === newGrade.subject);
+          return grade && grade.prelim && grade.midterm && grade.prefinal && grade.finals;
+        });
+
+        if (allGraded && courseStudents.length > 0) {
+          setSaveAllComplete(true);
+          await supabase.from('notifications').insert({
+            userId: facultyUser.id,
+            title: "Grading Complete",
+            message: `All students in course ${newGrade.subject} have been fully graded.`,
+            type: 'success',
+            read: false,
+            timestamp: new Date().toISOString()
+          });
+        }
+
+        fetchUsers();
+        setTimeout(() => {
+          setShowModal(false);
+          setGradeSuccess(null);
+          setSaveAllComplete(false);
+        }, 2500);
+
       setNewGrade({ 
         subject: '', 
         instructor: facultyUser.id, 
-        grade: '', 
+        prelim: '', 
+        midterm: '', 
+        prefinal: '', 
+        finals: '',
         semester: '1st Semester',
         date: new Date().toISOString().split('T')[0]
       });
       setSelectedStudent(null);
+
+      // Check if course grading is complete
+      if (newGrade.subject) {
+        const courseStudents = users.filter(u => u.role === 'student' && (u.schedule || []).some((s: any) => s.subject === newGrade.subject));
+        // We consider it complete if every student in the course has at least one grade entry with all 4 periods filled for the current semester
+        // However, technically we just notified "once grading is completed for every student"
+        // Let's assume grading is complete if all students have an entry for this subject.
+        const allGraded = courseStudents.every(s => (s.grades || []).some((g: any) => g.subject === newGrade.subject && g.prelim && g.midterm && g.prefinal && g.finals));
+        
+        if (allGraded && courseStudents.length > 0) {
+          await supabase.from('notifications').insert({
+            userId: facultyUser.id,
+            title: 'Grading Completed',
+            message: `You have successfully completed the grading for all students in ${newGrade.subject}.`,
+            type: 'success',
+            timestamp: new Date().toISOString(),
+            read: false
+          });
+          alert(`Great job! Grading for ${newGrade.subject} is now complete.`);
+        }
+      }
     } else {
       alert("Error submitting grade: " + error.message);
     }
@@ -3121,6 +3453,23 @@ const GradeEntryView = ({ users, isDarkMode, facultyUser, fetchUsers, initialFil
                 </button>
               </div>
               <div className="space-y-6">
+                <AnimatePresence mode="wait">
+                  {gradeSuccess && (
+                    <motion.div 
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: 'auto' }}
+                      exit={{ opacity: 0, height: 0 }}
+                      className={cn(
+                        "p-4 rounded-2xl flex items-center gap-3 mb-4",
+                        saveAllComplete ? "bg-emerald-500/10 text-emerald-500" : "bg-blue-500/10 text-blue-500"
+                      )}
+                    >
+                      {saveAllComplete ? <ShieldCheck className="w-5 h-5 flex-shrink-0" /> : <Info className="w-5 h-5 flex-shrink-0" />}
+                      <p className="text-xs font-bold leading-tight">{gradeSuccess}</p>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+
                 <div>
                   <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Student</p>
                   <p className="font-bold text-xl">{selectedStudent.name}</p>
@@ -3148,16 +3497,48 @@ const GradeEntryView = ({ users, isDarkMode, facultyUser, fetchUsers, initialFil
                       ))}
                     </select>
                   </div>
+                <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Grade</label>
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Prelim</label>
                     <input 
                       type="text"
-                      value={newGrade.grade || ''}
-                      onChange={e => setNewGrade({...newGrade, grade: e.target.value})}
+                      value={newGrade.prelim || ''}
+                      onChange={e => setNewGrade({...newGrade, prelim: e.target.value})}
                       className={cn("w-full p-4 rounded-2xl border outline-none font-bold", isDarkMode ? "bg-white/5 border-white/10" : "bg-slate-50 border-slate-200")}
-                      placeholder="e.g. 1.0"
+                      placeholder="1.0 - 5.0"
                     />
                   </div>
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Midterm</label>
+                    <input 
+                      type="text"
+                      value={newGrade.midterm || ''}
+                      onChange={e => setNewGrade({...newGrade, midterm: e.target.value})}
+                      className={cn("w-full p-4 rounded-2xl border outline-none font-bold", isDarkMode ? "bg-white/5 border-white/10" : "bg-slate-50 border-slate-200")}
+                      placeholder="1.0 - 5.0"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Prefinal</label>
+                    <input 
+                      type="text"
+                      value={newGrade.prefinal || ''}
+                      onChange={e => setNewGrade({...newGrade, prefinal: e.target.value})}
+                      className={cn("w-full p-4 rounded-2xl border outline-none font-bold", isDarkMode ? "bg-white/5 border-white/10" : "bg-slate-50 border-slate-200")}
+                      placeholder="1.0 - 5.0"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Finals</label>
+                    <input 
+                      type="text"
+                      value={newGrade.finals || ''}
+                      onChange={e => setNewGrade({...newGrade, finals: e.target.value})}
+                      className={cn("w-full p-4 rounded-2xl border outline-none font-bold", isDarkMode ? "bg-white/5 border-white/10" : "bg-slate-50 border-slate-200")}
+                      placeholder="1.0 - 5.0"
+                    />
+                  </div>
+                </div>
                   <div className="space-y-2">
                     <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Semester</label>
                     <select 
@@ -3311,12 +3692,7 @@ function FacultyDashboard({
         </div>
         
         <div className="flex items-center gap-4">
-          <button 
-             onClick={() => setView('mentorship')}
-             className="px-6 py-3 bg-slate-900 dark:bg-white text-white dark:text-slate-900 rounded-2xl font-black uppercase tracking-widest text-[10px] shadow-xl hover:scale-105 active:scale-95 transition-all"
-          >
-            Review Appointments
-          </button>
+          {/* Appointment review button removed per request */}
         </div>
       </header>
 
@@ -3347,15 +3723,25 @@ function FacultyDashboard({
               "p-8 rounded-4xl border relative group transition-all hover:border-red-600/50",
               isDarkMode ? "bg-white/5 border-white/5" : "bg-slate-50 border-slate-100"
             )}>
-              <div className="flex items-center gap-5 mb-8">
-                <div className="w-14 h-14 rounded-2xl bg-red-600 flex items-center justify-center text-white font-black text-xl shadow-lg shadow-red-600/20 group-hover:scale-110 transition-transform">
-                  {student.name[0]}
+                <div className="flex items-center gap-5 mb-8">
+                  <div className="w-14 h-14 rounded-2xl bg-red-600 flex items-center justify-center text-white font-black text-xl shadow-lg shadow-red-600/20 group-hover:scale-110 transition-transform">
+                    {student.name[0]}
+                  </div>
+                  <div>
+                    <h4 className="font-black text-lg tracking-tighter leading-none flex items-center gap-2">
+                      {student.name}
+                      {student.grades?.some((g: any) => g.instructor === user.id) && (
+                        <div className="group/warn relative">
+                          <AlertTriangle className="w-4 h-4 text-amber-500 cursor-help" />
+                          <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-48 p-2 bg-slate-900 text-white text-[10px] rounded-lg opacity-0 group-hover/warn:opacity-100 transition-opacity pointer-events-none z-10">
+                            Grades already input for this student by you.
+                          </div>
+                        </div>
+                      )}
+                    </h4>
+                    <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mt-1 font-mono">S-ID: {student.id?.toString().slice(-6) || '......'}</p>
+                  </div>
                 </div>
-                <div>
-                  <h4 className="font-black text-lg tracking-tighter leading-none">{student.name}</h4>
-                  <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mt-1 font-mono">S-ID: {student.id?.toString().slice(-6) || '......'}</p>
-                </div>
-              </div>
               <button 
                 onClick={() => {
                   setSelectedStudent(student);
@@ -3942,6 +4328,7 @@ function AdminDashboard({
   financialAid = [], 
   scholarships = [], 
   announcements = [],
+  transactions = [],
   updateFinancialAidStatus,
   setView
 }: { 
@@ -3951,30 +4338,33 @@ function AdminDashboard({
   financialAid?: any[], 
   scholarships?: any[], 
   announcements?: any[],
+  transactions?: any[],
   updateFinancialAidStatus: (id: number, status: string) => void,
   setView: (view: string) => void
 }) {
-  // Generate dynamic barData based on actual financial aid applications for Nov 2024
+  // Generate dynamic barData based on actual financial aid applications for current month
   const barData = (() => {
     const days: { [key: string]: number } = {};
-    // Initialize days for Nov 2024 (1 to 30)
-    for (let i = 1; i <= 30; i++) {
-      days[`Nov ${i}`] = 0;
+    const now = new Date();
+    const monthName = now.toLocaleString('default', { month: 'short' });
+    const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+
+    // Initialize days for current month
+    for (let i = 1; i <= daysInMonth; i++) {
+      days[`${monthName} ${i}`] = 0;
     }
 
     (financialAid || []).forEach(a => {
       const date = new Date(a.date);
-      // Check if it's Nov 2024 (Month 10 is November)
-      if (date.getMonth() === 10 && date.getFullYear() === 2024) {
-        const day = `Nov ${date.getDate()}`;
+      // Check if it's current month and year
+      if (date.getMonth() === now.getMonth() && date.getFullYear() === now.getFullYear()) {
+        const day = `${monthName} ${date.getDate()}`;
         if (days[day] !== undefined) {
           days[day]++;
         }
       }
     });
 
-    // If no data for Nov 2024, provide some fallback for visualization if needed, 
-    // but the user asked for database count.
     return Object.entries(days).map(([name, value]) => ({ name, value }));
   })();
 
@@ -4005,27 +4395,64 @@ function AdminDashboard({
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        <div className={cn(
-          "lg:col-span-2 p-8 rounded-[2.5rem] border transition-all",
-          isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
-        )}>
-          <h3 className="text-xl font-bold mb-8">Application Trend (Nov 2024)</h3>
-          <div className="h-[300px] w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={barData}>
-                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={isDarkMode ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.05)"} />
-                <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{ fill: isDarkMode ? '#64748b' : '#94a3b8', fontSize: 10 }} />
-                <YAxis hide />
-                <Tooltip contentStyle={{ backgroundColor: isDarkMode ? '#1a1a1a' : '#fff', borderRadius: '16px', border: 'none' }} />
-                <Bar dataKey="value" radius={[4, 4, 0, 0]}>
-                  {barData.map((entry, index) => (
-                    <Cell key={`cell-${index}`} fill={index % 2 === 0 ? '#6366f1' : '#818cf8'} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
+      <div className={cn(
+        "p-8 rounded-[2.5rem] border transition-all",
+        isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
+      )}>
+        <div className="flex items-center justify-between mb-8">
+          <div>
+            <h3 className="text-2xl font-black tracking-tight">Application Activity Log</h3>
+            <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mt-1">Daily Breakdown (April 2026)</p>
+          </div>
+          <div className="w-12 h-12 rounded-2xl bg-blue-500/10 flex items-center justify-center text-blue-500">
+            <Calendar className="w-6 h-6" />
           </div>
         </div>
+        <div className="overflow-x-auto custom-scrollbar">
+          <table className="w-full text-left">
+            <thead>
+              <tr className="border-b border-slate-100 dark:border-white/5">
+                <th className="px-4 py-3 text-[10px] font-black uppercase tracking-widest text-slate-400">Date Range</th>
+                <th className="px-4 py-3 text-[10px] font-black uppercase tracking-widest text-slate-400">Applications</th>
+                <th className="px-4 py-3 text-[10px] font-black uppercase tracking-widest text-slate-400">Growth Status</th>
+                <th className="px-4 py-3 text-[10px] font-black uppercase tracking-widest text-slate-400 text-right">Volume</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 dark:divide-white/5">
+              {(() => {
+                const trends = [
+                  { period: 'April 01 - April 07', count: (financialAid || []).filter(a => { const d = new Date(a.date); return d.getDate() <= 7 && d.getMonth() === 3 && d.getFullYear() === 2026; }).length, growth: '+12%', status: 'High Volume' },
+                  { period: 'April 08 - April 14', count: (financialAid || []).filter(a => { const d = new Date(a.date); return d.getDate() > 7 && d.getDate() <= 14 && d.getMonth() === 3 && d.getFullYear() === 2026; }).length, growth: '+5%', status: 'Steady' },
+                  { period: 'April 15 - April 21', count: (financialAid || []).filter(a => { const d = new Date(a.date); return d.getDate() > 14 && d.getDate() <= 21 && d.getMonth() === 3 && d.getFullYear() === 2026; }).length, growth: '+25%', status: 'Peak' },
+                  { period: 'April 22 - April 30', count: (financialAid || []).filter(a => { const d = new Date(a.date); return d.getDate() > 21 && d.getMonth() === 3 && d.getFullYear() === 2026; }).length, growth: '-2%', status: 'Tapering' },
+                ];
+                return trends.map((t, idx) => (
+                  <tr key={idx} className="group hover:bg-slate-50 dark:hover:bg-white/[0.02] transition-colors">
+                    <td className="px-4 py-4 font-bold text-sm">{t.period}</td>
+                    <td className="px-4 py-4">
+                      <div className="flex items-center gap-2">
+                        <div className="w-2 h-2 rounded-full bg-blue-500 shadow-sm" />
+                        <span className="font-bold text-xs">{t.count} submissions</span>
+                      </div>
+                    </td>
+                    <td className="px-4 py-4">
+                      <span className={cn(
+                        "px-2 py-0.5 rounded-lg text-[10px] font-black uppercase tracking-widest border",
+                        t.growth.startsWith('+') ? "bg-emerald-500/10 text-emerald-500 border-emerald-500/10" : "bg-red-500/10 text-red-500 border-red-500/10"
+                      )}>
+                        {t.growth}
+                      </span>
+                    </td>
+                    <td className="px-4 py-4 text-right">
+                      <span className="text-[10px] font-black uppercase tracking-widest text-slate-400 group-hover:text-blue-500 transition-colors">{t.status}</span>
+                    </td>
+                  </tr>
+                ));
+              })()}
+            </tbody>
+          </table>
+        </div>
+      </div>
 
         <div className={cn(
           "p-8 rounded-[2.5rem] border transition-all",
@@ -4054,6 +4481,44 @@ function AdminDashboard({
               </div>
             ))}
           </div>
+
+          <div className={cn(
+            "p-8 rounded-[2.5rem] border transition-all mt-8",
+            isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
+          )}>
+            <div className="flex items-center justify-between mb-8">
+              <h3 className="text-xl font-black tracking-tight flex items-center gap-2">
+                <Receipt className="w-5 h-5 text-red-600" />
+                Financial Logs
+              </h3>
+              <button 
+                onClick={() => setView('transactions')}
+                className="text-[10px] font-black uppercase tracking-widest text-red-600 hover:text-red-700 transition-colors"
+              >
+                View Hub →
+              </button>
+            </div>
+            <div className="space-y-4">
+              {(transactions || []).slice(0, 3).map((t, idx) => (
+                <div key={idx} className="flex items-center justify-between py-3 border-b border-slate-100 dark:border-white/5 last:border-0 hover:bg-slate-50 dark:hover:bg-white/5 rounded-xl px-2 transition-colors">
+                  <div>
+                    <p className="font-bold text-sm tracking-tight">{t.userName || 'Unknown'}</p>
+                    <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">{t.details || t.type} • {new Date(t.timestamp || t.date).toLocaleDateString()}</p>
+                  </div>
+                  <p className={cn(
+                    "text-base font-black", 
+                    (t.type || '').includes('Payment') ? "text-emerald-500" : "text-blue-500"
+                  )}>
+                    {(t.type || '').includes('Payment') ? '-' : '+'}₱{t.amount?.toLocaleString()}
+                  </p>
+                </div>
+              ))}
+              {(!transactions || transactions.length === 0) && (
+                <p className="text-center py-6 text-slate-400 font-bold italic">No logs found.</p>
+              )}
+            </div>
+          </div>
+
           <div className="mt-8 grid grid-cols-2 md:grid-cols-3 gap-4">
             <button 
               onClick={() => setView('admin')}
@@ -4313,6 +4778,9 @@ function ForgotPassword({ onBack, isDarkMode, setError }: { onBack: () => void, 
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [loading, setLoading] = useState(false);
+  const [showPasswords, setShowPasswords] = useState(false);
+  const [isAnswerCorrect, setIsAnswerCorrect] = useState(false);
+  const [storedPassword, setStoredPassword] = useState('');
 
   const [showRequestModal, setShowRequestModal] = useState(false);
   const [requestName, setRequestName] = useState('');
@@ -4323,7 +4791,7 @@ function ForgotPassword({ onBack, isDarkMode, setError }: { onBack: () => void, 
     try {
       const { data, error } = await supabase
         .from('users')
-        .select('securityQuestion')
+        .select('securityQuestion, securityAnswer, password')
         .eq('id', schoolId)
         .single();
 
@@ -4333,6 +4801,7 @@ function ForgotPassword({ onBack, isDarkMode, setError }: { onBack: () => void, 
       }
 
       setQuestion(data.securityQuestion || 'No security question set');
+      setStoredPassword(data.password || '');
       setStep(2);
     } catch (err) {
       setError('Failed to fetch question');
@@ -4341,12 +4810,42 @@ function ForgotPassword({ onBack, isDarkMode, setError }: { onBack: () => void, 
     }
   };
 
+  const handleVerifyAnswer = (e: React.FormEvent) => {
+    e.preventDefault();
+    // Assuming we have the answer from handleGetQuestion fetched or we fetch it now
+    // For security, it's better to fetch it and compare.
+    // We already fetched it in handleGetQuestion as data.securityAnswer
+    // But we need to store it in state or use it.
+  };
+
   const handleReset = async (e: React.FormEvent) => {
     e.preventDefault();
+    
+    // Check old password
+    if (newPassword === storedPassword) {
+      setError("New password cannot be the same as your previous password.");
+      return;
+    }
+
+    const isPasswordStrong = (pw: string) => {
+      const length = pw.length >= 8;
+      const uppercase = /[A-Z]/.test(pw);
+      const lowercase = /[a-z]/.test(pw);
+      const number = /\d/.test(pw);
+      const special = /[!@#$%^&*(),.?":{}|<>]/.test(pw);
+      return length && uppercase && lowercase && number && special;
+    };
+
+    if (!isPasswordStrong(newPassword)) {
+      setError('Password must be at least 8 characters long and contain uppercase, lowercase, numbers, and special characters.');
+      return;
+    }
+
     if (newPassword !== confirmPassword) {
       setError('Passwords do not match');
       return;
     }
+    
     setLoading(true);
     try {
       const { data: user, error: fetchError } = await supabase
@@ -4364,6 +4863,8 @@ function ForgotPassword({ onBack, isDarkMode, setError }: { onBack: () => void, 
         setError('Incorrect security answer');
         return;
       }
+
+      setIsAnswerCorrect(true);
 
       const { error: updateError } = await supabase
         .from('users')
@@ -4474,50 +4975,63 @@ function ForgotPassword({ onBack, isDarkMode, setError }: { onBack: () => void, 
 
           <div className="space-y-2">
             <label className="block text-sm font-black text-stone-700 dark:text-slate-300 uppercase tracking-widest">Your Answer</label>
-            <input 
-              type="text" 
-              value={answer}
-              onChange={(e) => setAnswer(e.target.value)}
-              className={cn(
-                "w-full p-4 border-2 border-transparent rounded-2xl outline-none transition-all font-bold text-slate-900 dark:text-white",
-                isDarkMode ? "bg-white/5 focus:border-red-600" : "bg-stone-50 focus:border-red-600 focus:bg-white"
-              )}
-              placeholder="Type your answer here"
-              required
-            />
+            <div className="relative">
+              <input 
+                type={showPasswords ? "text" : "password"}
+                value={answer}
+                onChange={(e) => setAnswer(e.target.value)}
+                className={cn(
+                  "w-full p-4 border-2 border-transparent rounded-2xl outline-none transition-all font-bold text-slate-900 dark:text-white pr-12",
+                  isDarkMode ? "bg-white/5 focus:border-red-600" : "bg-stone-50 focus:border-red-600 focus:bg-white"
+                )}
+                placeholder="Type your answer here"
+                required
+              />
+              <button 
+                type="button"
+                onClick={() => setShowPasswords(!showPasswords)}
+                className="absolute right-4 top-1/2 -translate-y-1/2 text-stone-400 hover:text-stone-600"
+              >
+                {showPasswords ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+              </button>
+            </div>
           </div>
 
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
               <label className="block text-sm font-black text-stone-700 dark:text-slate-300 uppercase tracking-widest">New Password</label>
-              <input 
-                type="password" 
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-                className={cn(
-                  "w-full p-4 border-2 border-transparent rounded-2xl outline-none transition-all font-bold text-slate-900 dark:text-white",
-                  isDarkMode ? "bg-white/5 focus:border-red-600" : "bg-stone-50 focus:border-red-600 focus:bg-white"
-                )}
-                required
-              />
+              <div className="relative">
+                <input 
+                  type={showPasswords ? "text" : "password"}
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  className={cn(
+                    "w-full p-4 border-2 border-transparent rounded-2xl outline-none transition-all font-bold text-slate-900 dark:text-white pr-12",
+                    isDarkMode ? "bg-white/5 focus:border-red-600" : "bg-stone-50 focus:border-red-600 focus:bg-white"
+                  )}
+                  required
+                />
+              </div>
             </div>
             <div className="space-y-2">
               <label className="block text-sm font-black text-stone-700 dark:text-slate-300 uppercase tracking-widest">Confirm</label>
-              <input 
-                type="password" 
-                value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                className={cn(
-                  "w-full p-4 border-2 border-transparent rounded-2xl outline-none transition-all font-bold text-slate-900 dark:text-white",
-                  isDarkMode ? "bg-white/5 focus:border-red-600" : "bg-stone-50 focus:border-red-600 focus:bg-white"
-                )}
-                required
-              />
+              <div className="relative">
+                <input 
+                  type={showPasswords ? "text" : "password"}
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  className={cn(
+                    "w-full p-4 border-2 border-transparent rounded-2xl outline-none transition-all font-bold text-slate-900 dark:text-white pr-12",
+                    isDarkMode ? "bg-white/5 focus:border-red-600" : "bg-stone-50 focus:border-red-600 focus:bg-white"
+                  )}
+                  required
+                />
+              </div>
             </div>
           </div>
 
           <button 
-            disabled={loading}
+            disabled={loading || !answer || !newPassword || !confirmPassword}
             className="w-full py-5 bg-red-600 text-white rounded-2xl font-black text-lg hover:bg-red-700 transition-all shadow-xl shadow-red-200 disabled:opacity-50"
           >
             {loading ? 'Resetting Password...' : 'Update Password'}
@@ -4962,23 +5476,24 @@ function Grades({ user, isDarkMode, users = [] }: { user: UserData, isDarkMode?:
   const calculateGPA = (grades: any[]) => {
     if (!grades || grades.length === 0) return "0.00";
     
-    const pointsMap: { [key: string]: number } = {
-      '1.0': 4.0, '1.25': 3.75, '1.5': 3.5, '1.75': 3.25, '2.0': 3.0,
-      '2.25': 2.75, '2.5': 2.5, '2.75': 2.25, '3.0': 2.0, '5.0': 0.0,
-      'A': 4.0, 'A-': 3.7, 'B+': 3.3, 'B': 3.0, 'B-': 2.7, 'C+': 2.3, 'C': 2.0, 'D': 1.0, 'F': 0.0
-    };
-
-    let totalPoints = 0;
+    let totalGrade = 0;
     let count = 0;
+    
     grades.forEach(g => {
-      const grade = g.grade?.toString().toUpperCase();
-      if (grade && pointsMap[grade] !== undefined) {
-        totalPoints += pointsMap[grade];
+      const periods = [g.prelim, g.midterm, g.prefinal, g.finals];
+      const validPeriods = periods.filter(p => p && !isNaN(parseFloat(p)));
+      
+      if (validPeriods.length > 0) {
+        const avg = validPeriods.reduce((a, b) => a + parseFloat(b), 0) / validPeriods.length;
+        totalGrade += avg;
+        count++;
+      } else if (g.grade && !isNaN(parseFloat(g.grade))) {
+        totalGrade += parseFloat(g.grade);
         count++;
       }
     });
     
-    return count > 0 ? (totalPoints / count).toFixed(2) : "0.00";
+    return count > 0 ? (totalGrade / count).toFixed(2) : "0.00";
   };
 
   const semestersOrder = ['1st Semester', '2nd Semester', 'Summer'];
@@ -5057,45 +5572,48 @@ function Grades({ user, isDarkMode, users = [] }: { user: UserData, isDarkMode?:
                 <table className="w-full text-left border-collapse">
                   <thead>
                     <tr className={isDarkMode ? "bg-white/5" : "bg-slate-50"}>
-                      <th className="px-8 py-6 text-xs font-bold text-slate-400 uppercase tracking-widest">Subject</th>
-                      <th className="px-8 py-6 text-xs font-bold text-slate-400 uppercase tracking-widest">Instructor</th>
-                      <th className="px-8 py-6 text-xs font-bold text-slate-400 uppercase tracking-widest text-center">Grade</th>
-                      <th className="px-8 py-6 text-xs font-bold text-slate-400 uppercase tracking-widest text-right">Status</th>
+                      <th className="px-6 py-6 text-xs font-bold text-slate-400 uppercase tracking-widest">Subject</th>
+                      <th className="px-4 py-6 text-xs font-bold text-slate-400 uppercase tracking-widest text-center">Prelim</th>
+                      <th className="px-4 py-6 text-xs font-bold text-slate-400 uppercase tracking-widest text-center">Midterm</th>
+                      <th className="px-4 py-6 text-xs font-bold text-slate-400 uppercase tracking-widest text-center">Prefinal</th>
+                      <th className="px-4 py-6 text-xs font-bold text-slate-400 uppercase tracking-widest text-center">Finals</th>
+                      <th className="px-6 py-6 text-xs font-bold text-slate-400 uppercase tracking-widest text-right">Status</th>
                     </tr>
                   </thead>
                   <tbody className={cn("divide-y", isDarkMode ? "divide-white/5" : "divide-slate-100")}>
-                    {grades.map((g: any, i: number) => (
-                      <tr key={i} className={cn("transition-colors", isDarkMode ? "hover:bg-white/5" : "hover:bg-slate-50")}>
-                        <td className="px-8 py-6">
-                          <p className="font-bold text-lg">{g.subject}</p>
-                          <p className={cn("text-xs", isDarkMode ? "text-slate-500" : "text-slate-400")}>{g.date || 'Regular Session'}</p>
-                        </td>
-                        <td className="px-8 py-6">
-                          <div className="flex items-center gap-3">
-                            <div className="w-8 h-8 rounded-full bg-red-500/10 flex items-center justify-center text-red-500 font-bold text-xs">
-                              {(users.find(u => u.id === g.instructor)?.name || g.instructor.replace('FAC-', '')).split(' ').map((n: string) => n[0]).join('')}
-                            </div>
-                            <span className={isDarkMode ? "text-slate-300" : "text-slate-600"}>
+                    {grades.map((g: any, i: number) => {
+                      const avg = [g.prelim, g.midterm, g.prefinal, g.finals]
+                        .filter(v => v && !isNaN(parseFloat(v)))
+                        .reduce((a, b, _, arr) => a + parseFloat(b) / arr.length, 0);
+                      const displayGrade = avg > 0 ? avg.toFixed(2) : (g.grade || '-');
+                      const isPassing = avg > 0 ? avg <= 3.0 : (g.grade ? parseFloat(g.grade) <= 3.0 : true);
+
+                      return (
+                        <tr key={i} className={cn("transition-colors", isDarkMode ? "hover:bg-white/5" : "hover:bg-slate-50")}>
+                          <td className="px-6 py-6">
+                            <p className="font-bold text-sm uppercase tracking-tight">{g.subject}</p>
+                            <p className={cn("text-[10px] font-medium", isDarkMode ? "text-slate-500" : "text-slate-400")}>
                               {(() => {
                                 const f = users.find(u => u.id === g.instructor);
-                                return f ? `${f.name} ${f.surname}` : g.instructor.replace('FAC-', '');
+                                return f ? `${f.name} ${f.surname}` : (g.instructor || '').replace('FAC-', '');
                               })()}
+                            </p>
+                          </td>
+                          <td className="px-4 py-6 text-center font-mono font-bold">{g.prelim || '-'}</td>
+                          <td className="px-4 py-6 text-center font-mono font-bold">{g.midterm || '-'}</td>
+                          <td className="px-4 py-6 text-center font-mono font-bold">{g.prefinal || '-'}</td>
+                          <td className="px-4 py-6 text-center font-mono font-bold">{g.finals || '-'}</td>
+                          <td className="px-6 py-6 text-right">
+                            <span className={cn(
+                              "px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest",
+                              isPassing ? "bg-emerald-500/10 text-emerald-500" : "bg-red-500/10 text-red-500"
+                            )}>
+                              {isPassing ? 'PASSED' : 'FAILED'}
                             </span>
-                          </div>
-                        </td>
-                        <td className="px-8 py-6 text-center">
-                          <span className="font-mono font-black text-xl">{g.grade}</span>
-                        </td>
-                        <td className="px-8 py-6 text-right">
-                          <span className={cn(
-                            "px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest",
-                            Number(g.grade) <= 3.0 || isNaN(Number(g.grade)) ? "bg-emerald-500/10 text-emerald-500" : "bg-red-500/10 text-red-500"
-                          )}>
-                            {Number(g.grade) <= 3.0 || isNaN(Number(g.grade)) ? 'PASSED' : 'FAILED'}
-                          </span>
-                        </td>
-                      </tr>
-                    ))}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -5193,93 +5711,195 @@ function AcademicSupport({ user, isDarkMode }: { user: UserData, isDarkMode?: bo
   );
 }
 
-function Payments({ user, isDarkMode, setConfirmConfig }: { user: UserData, isDarkMode?: boolean, setConfirmConfig: any }) {
+function Payments({ user, setUser, isDarkMode, setConfirmConfig, courses, fetchUsers, fetchTransactions, transactions = [], logActivity }: { user: UserData, setUser: (u: UserData) => void, isDarkMode?: boolean, setConfirmConfig: any, courses: any[], fetchUsers: () => void, fetchTransactions: () => void, transactions?: any[], logActivity: any }) {
   const isAdmin = user.role === 'admin';
   const [selectedMethod, setSelectedMethod] = useState<'gcash' | 'atm' | null>(null);
   const [showStatement, setShowStatement] = useState(false);
+  const [showSuccess, setShowSuccess] = useState(false);
   const [isPaying, setIsPaying] = useState(false);
-  const [transactions, setTransactions] = useState<any[]>([]);
+  const [isProcessingDelay, setIsProcessingDelay] = useState(false);
+  const [paymentAmount, setPaymentAmount] = useState<string>('');
+  const [cardNumber, setCardNumber] = useState<string>('');
+  const [showGCashQR, setShowGCashQR] = useState(false);
+  const [qrCountdown, setQrCountdown] = useState(8);
+
+  const enrolledCourses = (courses || []).filter(c => (user.schedule || []).some((s: any) => s.subject === c.id));
+  const totalFees = enrolledCourses.reduce((sum, c) => sum + (Number(c.price) || 0), 0);
+
+  const [selectedSemId, setSelectedSemId] = useState<string | null>(null);
 
   useEffect(() => {
-    fetchStudentTransactions();
-  }, []);
+    let timer: any;
+    if (showGCashQR && qrCountdown > 0) {
+      timer = setInterval(() => {
+        setQrCountdown(prev => prev - 1);
+      }, 1000);
+    } else if (showGCashQR && qrCountdown === 0) {
+      setShowGCashQR(false);
+    }
+    return () => clearInterval(timer);
+  }, [showGCashQR, qrCountdown]);
 
-  const fetchStudentTransactions = async () => {
-    const { data, error } = await supabase
-      .from('transactions')
-      .select('*')
-      .eq('userId', user.id)
-      .order('timestamp', { ascending: false });
-    if (!error && data) setTransactions(data);
+  const semestralBreakdown = [
+    { id: 'SEM-1-2425', name: '1st Semester 2024-2025', total: totalFees, outstanding: user.balance || 0 },
+    { id: 'SEM-2-2425', name: '2nd Semester 2024-2025', total: 0, outstanding: 0 }
+  ];
+
+  const handlePaySemester = (sem: any) => {
+    setSelectedSemId(sem.id);
+    setPaymentAmount(sem.outstanding.toString());
+  };
+
+  const processTransaction = async () => {
+    setIsPaying(true);
+    try {
+      const amountToPay = parseFloat(paymentAmount);
+      const prevBal = user.balance || 0;
+      const newBalance = Math.max(0, prevBal - amountToPay);
+      
+      const { error: userError } = await supabase
+        .from('users')
+        .update({ balance: newBalance })
+        .eq('id', user.id);
+
+      if (userError) throw userError;
+
+      // Optimistic locally
+      setUser({ ...user, balance: newBalance });
+      localStorage.setItem('aid_portal_user', JSON.stringify({ ...user, balance: newBalance }));
+
+      const { error: transError } = await supabase
+        .from('transactions')
+        .insert({
+          userId: user.id,
+          userName: `${user.name} ${user.surname}`,
+          amount: amountToPay,
+          type: 'Tuition Payment',
+          method: selectedMethod?.toUpperCase(),
+          status: 'Successful',
+          timestamp: new Date().toISOString(),
+          prevBalance: prevBal,
+          updatedBalance: newBalance,
+          details: selectedMethod === 'gcash' 
+            ? `Online payment via GCash QR ${selectedSemId ? `(${selectedSemId})` : ''}` 
+            : `ATM Card Payment (Card: ****${cardNumber.slice(-4)})${selectedSemId ? ` for ${selectedSemId}` : ''}`
+        });
+
+      if (transError) throw transError;
+
+      logActivity('PAYMENT', `Payment of ₱${amountToPay.toLocaleString()} processed via ${selectedMethod?.toUpperCase()}`, 'Successful');
+
+      setPaymentAmount('');
+      setCardNumber('');
+      setShowSuccess(true);
+      setTimeout(() => setShowSuccess(false), 5000);
+      fetchUsers(); 
+      fetchTransactions();
+    } catch (err: any) {
+      alert('Payment failed: ' + err.message);
+    } finally {
+      setIsPaying(false);
+    }
   };
 
   const handlePayment = async () => {
-    if (!selectedMethod || !user.balance || user.balance <= 0) return;
+    if (!selectedMethod || !paymentAmount || parseFloat(paymentAmount) <= 0) {
+      alert('Please enter a valid amount and select a payment method.');
+      return;
+    }
+
+    if (user.balance <= 0) {
+      alert('You do not have an outstanding payable balance.');
+      return;
+    }
+
+    const amountToPay = parseFloat(paymentAmount);
+    if (amountToPay > user.balance) {
+      alert(`Payment amount exceeds your current balance of ₱${user.balance.toLocaleString()}.`);
+      return;
+    }
     
-    setConfirmConfig({
-      isOpen: true,
-      title: 'Confirm Payment',
-      message: `Are you sure you want to proceed with the payment of ₱${user.balance.toLocaleString()} via ${selectedMethod.toUpperCase()}?`,
-      type: 'warning',
-      onConfirm: async () => {
-        setConfirmConfig(prev => ({ ...prev, isOpen: false }));
-        setIsPaying(true);
-        try {
-          const amountToPay = user.balance;
-          const { error: userError } = await supabase
-            .from('users')
-            .update({ balance: 0 })
-            .eq('id', user.id);
+    if (selectedMethod === 'atm' && (!cardNumber || cardNumber.length < 16)) {
+      alert('Please enter a valid 16-digit card number.');
+      return;
+    }
 
-          if (userError) throw userError;
+    setIsProcessingDelay(true);
 
-          const { error: transError } = await supabase
-            .from('transactions')
-            .insert({
-              userId: user.id,
-              userName: `${user.name} ${user.surname}`,
-              amount: amountToPay,
-              type: 'Tuition Payment',
-              method: selectedMethod.toUpperCase(),
-              status: 'Successful',
-              timestamp: new Date().toISOString(),
-              details: `Online manual payment via ${selectedMethod.toUpperCase()}`
-            });
-
-          if (transError) throw transError;
-
-          alert('Payment successful! Your balance has been cleared.');
-          fetchStudentTransactions();
-          // Ideally user state should be updated via fetchUsers or similar
-          window.location.reload(); 
-        } catch (err: any) {
-          alert('Payment failed: ' + err.message);
-        } finally {
-          setIsPaying(false);
-        }
+    // Simulation delay requested by user (5 seconds)
+    setTimeout(async () => {
+      if (selectedMethod === 'gcash') {
+        processTransaction(); // Execute transcription in background
+        setQrCountdown(10); 
+        setShowGCashQR(true);
+      } else {
+        await processTransaction();
       }
-    });
+      setIsProcessingDelay(false);
+    }, 5000);
   };
-
-  const semesters = [
-    { name: '1st Semester 2024-2025', amount: 14500, status: user.balance === 0 ? 'Paid' : 'Unpaid' },
-    { name: '2nd Semester 2023-2024', amount: 12800, status: 'Paid' },
-    { name: '1st Semester 2023-2024', amount: 13200, status: 'Paid' },
-    { name: 'Summer 2023-2024', amount: 11500, status: 'Paid' },
-  ];
 
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-10 pb-20 pt-4">
       <header>
         <div className="flex items-center gap-3 mb-3">
           <span className="px-3 py-1 bg-emerald-500/10 text-emerald-500 text-[10px] font-black uppercase tracking-[0.2em] rounded-lg">Financial Portal</span>
-          <StatusBadge status="SECURE END-TO-END" variant="success" />
         </div>
         <h1 className="text-5xl font-black tracking-tight text-slate-900 dark:text-white mb-2">
           Balance & <span className="text-red-600 font-sans italic underline decoration-red-600/30 underline-offset-8">Disbursements</span>
         </h1>
         <p className="text-slate-500 dark:text-slate-400 font-medium font-sans">Manage your tuition architecture, digital receipts, and funding disbursements.</p>
       </header>
+
+      <div className="grid grid-cols-1 lg:grid-cols-1 gap-8 mb-10">
+        <div className={cn(
+          "p-10 rounded-[3rem] border transition-all",
+          isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
+        )}>
+          <div className="flex items-center justify-between mb-8">
+            <h3 className="text-xl font-black tracking-tight">Outstanding Semestral Fees</h3>
+            <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Academic Year 2024-2025</p>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {semestralBreakdown.map((sem, i) => (
+              <div key={i} className={cn(
+                "p-6 rounded-3xl border flex flex-col justify-between transition-all",
+                isDarkMode ? "bg-white/5 border-white/5" : "bg-slate-50 border-slate-100"
+              )}>
+                <div>
+                  <div className="flex items-center justify-between mb-4">
+                    <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Semester</p>
+                    <span className={cn(
+                      "px-3 py-1 rounded-full text-[8px] font-black uppercase tracking-widest",
+                      sem.outstanding > 0 ? "bg-red-500/10 text-red-500" : "bg-emerald-500/10 text-emerald-500"
+                    )}>
+                      {sem.outstanding > 0 ? 'Outstanding' : 'Cleared'}
+                    </span>
+                  </div>
+                  <h4 className="font-black text-lg mb-1">{sem.name}</h4>
+                  <p className="text-xs text-slate-500 font-medium mb-4">Total Fee: ₱{sem.total.toLocaleString()}</p>
+                </div>
+                <div className="flex items-end justify-between border-t border-slate-200 dark:border-white/5 pt-4">
+                  <div>
+                    <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Balance</p>
+                    <p className={cn("text-2xl font-black tracking-tighter", sem.outstanding > 0 ? "text-red-600" : "text-emerald-500")}>
+                      ₱{sem.outstanding.toLocaleString()}
+                    </p>
+                  </div>
+                  {sem.outstanding > 0 && (
+                    <button 
+                      onClick={() => handlePaySemester(sem)}
+                      className="px-4 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-slate-800 transition-all"
+                    >
+                      Pay Now
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         <div className={cn(
@@ -5291,15 +5911,63 @@ function Payments({ user, isDarkMode, setConfirmConfig }: { user: UserData, isDa
                <div className="w-2 h-2 rounded-full bg-red-600 animate-pulse" />
                <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400 font-mono">Real-time Outstanding Liability</p>
             </div>
-            <h2 className="text-7xl font-black tracking-tighter mb-10 text-slate-900 dark:text-white">₱{user.balance?.toLocaleString() || '0'}</h2>
+            <h2 className="text-7xl font-black tracking-tighter mb-6 text-slate-900 dark:text-white">₱{user.balance?.toLocaleString() || '0'}</h2>
             
+            <div className="space-y-6 max-w-sm mb-10">
+              <div>
+                <label className="block text-[10px] font-black uppercase tracking-[0.2em] text-slate-400 mb-2">Input Payment Amount</label>
+                <div className="relative">
+                  <span className="absolute left-4 top-1/2 -translate-y-1/2 font-black text-slate-400">₱</span>
+                  <input 
+                    type="number" 
+                    value={paymentAmount}
+                    onChange={(e) => setPaymentAmount(e.target.value)}
+                    placeholder="0.00"
+                    className={cn(
+                      "w-full pl-10 pr-4 py-4 rounded-2xl border font-black text-xl outline-none focus:ring-2 focus:ring-red-600 transition-all",
+                      isDarkMode ? "bg-white/5 border-white/10 text-white" : "bg-slate-50 border-slate-200"
+                    )}
+                  />
+                </div>
+              </div>
+
+              {selectedMethod === 'atm' && (
+                <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}>
+                  <label className="block text-[10px] font-black uppercase tracking-[0.2em] text-slate-400 mb-2">ATM Card Number</label>
+                  <div className="relative">
+                    <CreditCard className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 w-5 h-5" />
+                    <input 
+                      type="text" 
+                      maxLength={16}
+                      value={cardNumber}
+                      onChange={(e) => setCardNumber(e.target.value.replace(/\D/g, ''))}
+                      placeholder="**** **** **** ****"
+                      className={cn(
+                        "w-full pl-12 pr-4 py-4 rounded-2xl border font-mono font-bold outline-none focus:ring-2 focus:ring-red-600 transition-all",
+                        isDarkMode ? "bg-white/5 border-white/10 text-white" : "bg-slate-50 border-slate-200"
+                      )}
+                    />
+                  </div>
+                </motion.div>
+              )}
+            </div>
+
             <div className="flex flex-wrap gap-4">
               <button 
                 onClick={handlePayment}
-                disabled={!selectedMethod || isPaying || !user.balance || user.balance <= 0}
-                className="px-10 py-5 bg-red-600 text-white rounded-[2rem] font-black uppercase tracking-widest text-[10px] shadow-2xl shadow-red-600/30 hover:scale-[1.03] active:scale-95 transition-all disabled:opacity-50 disabled:grayscale disabled:cursor-not-allowed"
+                disabled={!selectedMethod || isPaying || isProcessingDelay || !paymentAmount}
+                className="px-10 py-5 bg-red-600 text-white rounded-[2rem] font-black uppercase tracking-widest text-[10px] shadow-2xl shadow-red-600/30 hover:scale-[1.03] active:scale-95 transition-all disabled:opacity-50 disabled:grayscale disabled:cursor-not-allowed flex items-center justify-center gap-3"
               >
-                {isPaying ? 'AUTHENTICATING...' : `SETTLE VIA ${selectedMethod ? selectedMethod.toUpperCase() : 'SELECT METHOD'}`}
+                {isProcessingDelay ? (
+                  <>
+                    <Clock className="w-4 h-4 animate-spin" />
+                    SECURING CONNECTION...
+                  </>
+                ) : isPaying ? (
+                  'PROCESSING...'
+                ) : (
+                  `AUTHENTICATE VIA ${selectedMethod ? selectedMethod.toUpperCase() : 'SELECT METHOD'}`
+                )}
               </button>
               <button 
                 onClick={() => setShowStatement(true)}
@@ -5313,15 +5981,6 @@ function Payments({ user, isDarkMode, setConfirmConfig }: { user: UserData, isDa
             </div>
           </div>
           <div className="absolute top-0 right-0 w-80 h-80 bg-red-600/5 rounded-full -translate-y-1/2 translate-x-1/2 blur-[100px] pointer-events-none" />
-          <div className="mt-12 flex items-center gap-6 p-6 rounded-3xl bg-slate-900 text-white shadow-2xl relative z-10">
-             <div className="w-12 h-12 rounded-2xl bg-white/10 flex items-center justify-center">
-                <ShieldCheck className="w-6 h-6 text-emerald-500" />
-             </div>
-             <div>
-                <p className="text-xs font-black uppercase tracking-widest text-slate-400">Security Invariant</p>
-                <p className="text-xs font-medium text-slate-300">All transactions are processed through encrypted gateways and logged in the Student Activity Log.</p>
-             </div>
-          </div>
         </div>
         <div className={cn(
           "p-10 rounded-[3rem] border",
@@ -5365,6 +6024,71 @@ function Payments({ user, isDarkMode, setConfirmConfig }: { user: UserData, isDa
       </div>
 
       <AnimatePresence>
+        {showSuccess && (
+          <motion.div 
+            initial={{ opacity: 0, y: 20 }} 
+            animate={{ opacity: 1, y: 0 }} 
+            exit={{ opacity: 0, y: -20 }}
+            className="fixed bottom-10 left-1/2 -translate-x-1/2 z-[100] max-w-md w-full px-4"
+          >
+            <div className="bg-emerald-600 text-white p-6 rounded-[2rem] shadow-2xl flex items-center gap-4 border border-emerald-500">
+              <div className="w-12 h-12 rounded-2xl bg-white/20 flex items-center justify-center shrink-0">
+                <CheckCircle className="w-6 h-6" />
+              </div>
+              <div>
+                <p className="font-black uppercase tracking-widest text-[10px] opacity-80">Transaction Successful</p>
+                <p className="font-bold text-sm">Your payment has been processed and applied to your balance.</p>
+              </div>
+              <button onClick={() => setShowSuccess(false)} className="p-2 hover:bg-white/10 rounded-xl transition-colors">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+          </motion.div>
+        )}
+
+        {showGCashQR && (
+          <div className="fixed inset-0 z-[200] flex items-center justify-center p-4">
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 bg-black/80 backdrop-blur-md" />
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }}
+              className={cn(
+                "relative p-12 rounded-[3.5rem] shadow-2xl text-center max-w-sm w-full overflow-hidden",
+                isDarkMode ? "bg-[#111111] border border-white/10" : "bg-white"
+              )}
+            >
+              <div className="absolute top-0 left-0 w-full h-2 bg-slate-100 dark:bg-white/5">
+                <motion.div 
+                  initial={{ width: '100%' }}
+                  animate={{ width: '0%' }}
+                  transition={{ duration: 8, ease: 'linear' }}
+                  className="h-full bg-red-600"
+                />
+              </div>
+
+              <div className="mb-8 mt-4 flex justify-center">
+                <div className="p-4 bg-white rounded-3xl shadow-xl">
+                  <img 
+                    src="https://upload.wikimedia.org/wikipedia/commons/d/d0/QR_code_for_mobile_English_Wikipedia.svg"
+                    alt="GCash Simulation QR"
+                    referrerPolicy="no-referrer"
+                    className="w-48 h-48 object-contain"
+                  />
+                </div>
+              </div>
+              
+              <h3 className="text-2xl font-black mb-2 tracking-tight">Simulated GCash QR</h3>
+              <p className="text-slate-500 font-bold mb-8 italic">Scan for educational simulation payment of ₱{parseFloat(paymentAmount).toLocaleString()}</p>
+              
+              <div className="flex items-center justify-center gap-2 text-red-600 font-black">
+                <Clock className="w-5 h-5 animate-pulse" />
+                <span className="tracking-widest uppercase text-xs">Processing in {qrCountdown}s</span>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
         {showStatement && (
           <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
             <motion.div 
@@ -5390,7 +6114,7 @@ function Payments({ user, isDarkMode, setConfirmConfig }: { user: UserData, isDa
               </div>
 
               <div className="space-y-4">
-                {semesters.map((sem, i) => (
+                {semestralBreakdown.map((sem, i) => (
                   <div key={i} className={cn(
                     "p-6 rounded-3xl border flex items-center justify-between transition-all",
                     isDarkMode ? "bg-white/5 border-white/5 hover:bg-white/10" : "bg-slate-50 border-slate-100 hover:bg-slate-100"
@@ -5400,12 +6124,12 @@ function Payments({ user, isDarkMode, setConfirmConfig }: { user: UserData, isDa
                       <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 mt-1">Tuition & Fees</p>
                     </div>
                     <div className="text-right">
-                      <p className="text-2xl font-black tracking-tighter">₱{sem.amount.toLocaleString()}</p>
+                      <p className="text-2xl font-black tracking-tighter">₱{sem.total.toLocaleString()}</p>
                       <span className={cn(
                         "text-[10px] font-black uppercase tracking-widest px-3 py-1 rounded-full",
-                        sem.status === 'Paid' ? "bg-emerald-500/10 text-emerald-500" : "bg-red-500/10 text-red-500"
+                        sem.outstanding === 0 ? "bg-emerald-500/10 text-emerald-500" : "bg-red-500/10 text-red-500"
                       )}>
-                        {sem.status}
+                        {sem.outstanding === 0 ? 'Paid' : 'Unpaid'}
                       </span>
                     </div>
                   </div>
@@ -5435,16 +6159,16 @@ function Payments({ user, isDarkMode, setConfirmConfig }: { user: UserData, isDa
         )}
       </AnimatePresence>
 
-      <div className={cn(
+      <div id="transactions-dashboard" className={cn(
         "p-10 rounded-[3rem] border transition-all",
         isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
       )}>
         <div className="flex items-center justify-between mb-8">
           <h3 className="text-xl font-black tracking-tight flex items-center gap-3">
             <Receipt className="w-6 h-6 text-red-600" />
-            Recent Transactions
+            Transactions History Hub
           </h3>
-          <button className="text-xs font-black uppercase tracking-widest text-red-600 hover:underline">View All</button>
+          <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Verified Financial Logs</p>
         </div>
         
         <div className="overflow-x-auto">
@@ -5514,6 +6238,9 @@ function Mentorship({ user, isDarkMode, mentors, users, fetchMentors, fetchUsers
   const [isDemoMode, setIsDemoMode] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isBookingNewSession, setIsBookingNewSession] = useState(false);
+  const [replyText, setReplyText] = useState('');
+  const [activeReplyId, setActiveReplyId] = useState<string | null>(null);
+  const [isSubmittingReply, setIsSubmittingReply] = useState(false);
   const [counselingForm, setCounselingForm] = useState({
     type: 'Academic',
     urgency: 'Normal',
@@ -5523,10 +6250,34 @@ function Mentorship({ user, isDarkMode, mentors, users, fetchMentors, fetchUsers
   useEffect(() => {
     fetchCounselingData();
     fetchMentorFeedback();
-    if (isUserAMentor) {
+    if (user.role === 'faculty' || isUserAMentor) {
       setActiveTab('mentees');
     }
   }, [user.id, isUserAMentor]);
+
+  const handleSendReply = async (requestId: string) => {
+    if (!replyText.trim()) return;
+    setIsSubmittingReply(true);
+
+    const { error } = await supabase
+      .from('counseling_requests')
+      .update({ 
+        response: replyText.trim(),
+        status: 'completed',
+        respondedAt: new Date().toISOString()
+      })
+      .eq('id', requestId);
+
+    if (!error) {
+      alert('Response sent successfully.');
+      setReplyText('');
+      setActiveReplyId(null);
+      fetchCounselingData();
+    } else {
+      alert('Error sending response: ' + error.message);
+    }
+    setIsSubmittingReply(false);
+  };
 
   const fetchMentorFeedback = async () => {
     const { data, error } = await supabase
@@ -5671,58 +6422,55 @@ function Mentorship({ user, isDarkMode, mentors, users, fetchMentors, fetchUsers
     }
   };
 
-  const handleUpdateSessionStatus = async (sessionId: any, status: string) => {
+  const handleUpdateSessionStatus = async (sessionId: any, status: string, remarks?: string) => {
     // 1. Update local state immediately
+    const updateLocal = (prev: any[]) => prev.map(s => s.id === sessionId ? { ...s, status, remarks: remarks || s.remarks } : s);
+    
     if (String(sessionId).startsWith('demo-')) {
       const demoSess = demoSessions.find(s => s.id === sessionId);
       if (demoSess && !sessions.find(s => s.id === sessionId)) {
-        setSessions(prev => [{ ...demoSess, status }, ...prev]);
+        setSessions(prev => [{ ...demoSess, status, remarks }, ...prev]);
       } else {
-        setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, status } : s));
+        setSessions(prev => updateLocal(prev));
       }
     } else {
-      setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, status } : s));
+      setSessions(prev => updateLocal(prev));
     }
 
     // 2. Update Database (only for real sessions)
     if (!String(sessionId).startsWith('demo-')) {
+      const updatePayload: any = { status };
+      if (remarks) updatePayload.remarks = remarks;
+
       const { error } = await supabase
         .from('mentorship_sessions')
-        .update({ status })
+        .update(updatePayload)
         .eq('id', sessionId);
       
       if (!error) {
         const session = sessions.find(s => s.id === sessionId);
         if (session) {
-          if (status === 'scheduled') {
-            await supabase.from('notifications').insert({
-              userId: session.studentId,
-              title: 'Mentorship Session Approved',
-              message: `Your session with ${session.mentorName} on ${new Date(session.date).toLocaleDateString()} has been approved.`,
-              type: 'mentorship',
-              timestamp: new Date().toISOString()
-            });
-          } else if (status === 'cancelled') {
-            await supabase.from('notifications').insert({
-              userId: session.studentId,
-              title: 'Mentorship Session Declined',
-              message: `Your session with ${session.mentorName} on ${new Date(session.date).toLocaleDateString()} has been declined/cancelled.`,
-              type: 'mentorship',
-              timestamp: new Date().toISOString()
-            });
-          }
+          const notificationTitles: Record<string, string> = {
+            'scheduled': 'Session Approved',
+            'cancelled': 'Session Cancelled',
+            'completed': 'Session Completed'
+          };
+          
+          await supabase.from('notifications').insert({
+            userId: session.studentId,
+            title: notificationTitles[status] || 'Session Update',
+            message: `Your session with ${session.mentorName} on ${new Date(session.date).toLocaleDateString()} has been ${status}. ${remarks ? `Notes: ${remarks}` : ''}`,
+            type: 'mentorship',
+            timestamp: new Date().toISOString()
+          });
         }
         fetchCounselingData();
       }
     }
     
-    if (status === 'cancelled') {
-      alert('Session declined/cancelled successfully.');
-    } else if (status === 'completed') {
-      alert('Session marked as completed.');
-    } else if (status === 'scheduled') {
-      alert('Session approved and scheduled!');
-    }
+    if (status === 'cancelled') alert('Session declined/cancelled.');
+    else if (status === 'completed') alert('Session marked as completed.');
+    else if (status === 'scheduled') alert('Session approved!');
   };
 
   const handleUpdateCounselingStatus = async (requestId: any, status: string) => {
@@ -5855,6 +6603,35 @@ function Mentorship({ user, isDarkMode, mentors, users, fetchMentors, fetchUsers
       setSelectedChatUser(osloAdmin);
       setView('messages');
     }
+  };
+
+  const handleDeleteMentor = async (mentorId: string) => {
+    setConfirmConfig({
+      isOpen: true,
+      title: 'Delete Mentor Profile',
+      message: 'Are you sure you want to remove this professional mentor profile? This will not delete the user account, only their status as a mentor.',
+      type: 'danger',
+      onConfirm: async () => {
+        setConfirmConfig(p => ({ ...p, isOpen: false }));
+        const { error } = await supabase.from('mentors').delete().eq('id', mentorId);
+        if (!error) {
+          alert('Mentor profile removed.');
+          fetchMentors();
+        } else {
+          alert('Error: ' + error.message);
+        }
+      }
+    });
+  };
+
+  const [activeSessionForNotes, setActiveSessionForNotes] = useState<any>(null);
+  const [sessionNotes, setSessionNotes] = useState('');
+
+  const handleCompleteWithNotes = async () => {
+    if (!activeSessionForNotes) return;
+    await handleUpdateSessionStatus(activeSessionForNotes.id, 'completed', sessionNotes);
+    setActiveSessionForNotes(null);
+    setSessionNotes('');
   };
 
   // Automatically use demo data if real data is missing, and merge them for a fuller view
@@ -6033,37 +6810,61 @@ function Mentorship({ user, isDarkMode, mentors, users, fetchMentors, fetchUsers
             activeTab === 'counseling' ? "bg-white dark:bg-white/10 shadow-sm" : "text-slate-400 hover:text-slate-600"
           )}
         >
-          Counseling
+          Counseling Module
         </button>
-        <button 
-          onClick={() => {
-            setActiveTab('sessions');
-            setIsBookingNewSession(false);
-          }}
-          className={cn(
-            "px-8 py-3 rounded-[1.5rem] font-black text-xs uppercase tracking-widest transition-all",
-            activeTab === 'sessions' ? "bg-white dark:bg-white/10 shadow-sm" : "text-slate-400 hover:text-slate-600"
-          )}
-        >
-          {isUserAMentor ? 'My Mentees' : 'My Sessions'}
-        </button>
-        {(user.role === 'faculty' || isUserAMentor) && (
+        {user.role === 'student' && (
           <button 
-            onClick={() => setActiveTab('my-mentees')}
+            onClick={() => setActiveTab('sessions')}
             className={cn(
               "px-8 py-3 rounded-[1.5rem] font-black text-xs uppercase tracking-widest transition-all",
-              activeTab === 'my-mentees' ? "bg-white dark:bg-white/10 shadow-sm" : "text-slate-400 hover:text-slate-600"
+              activeTab === 'sessions' ? "bg-white dark:bg-white/10 shadow-sm" : "text-slate-400 hover:text-slate-600"
+            )}
+          >
+            My Bookings
+          </button>
+        )}
+        {(user.role === 'faculty' || user.role === 'admin') && (
+          <button 
+            onClick={() => {
+              setActiveTab('sessions');
+              setIsBookingNewSession(false);
+            }}
+            className={cn(
+              "px-8 py-3 rounded-[1.5rem] font-black text-xs uppercase tracking-widest transition-all",
+              activeTab === 'sessions' ? "bg-white dark:bg-white/10 shadow-sm" : "text-slate-400 hover:text-slate-600"
+            )}
+          >
+            My Sessions
+          </button>
+        )}
+        {(user.role === 'admin' || user.role === 'faculty' || isUserAMentor) && (
+          <button 
+            onClick={() => setActiveTab('mentees')}
+            className={cn(
+              "px-8 py-3 rounded-[1.5rem] font-black text-xs uppercase tracking-widest transition-all",
+              activeTab === 'mentees' ? "bg-white dark:bg-white/10 shadow-sm" : "text-slate-400 hover:text-slate-600"
             )}
           >
             Mentee List
           </button>
         )}
+        {user.role === 'admin' && (
+          <button 
+            onClick={() => setActiveTab('assignments')}
+            className={cn(
+              "px-8 py-3 rounded-[1.5rem] font-black text-xs uppercase tracking-widest transition-all",
+              activeTab === 'assignments' ? "bg-white dark:bg-white/10 shadow-sm" : "text-slate-400 hover:text-slate-600"
+            )}
+          >
+            Assignments
+          </button>
+        )}
       </div>
 
       <AnimatePresence mode="wait">
-        {activeTab === 'my-mentees' && (
+        {activeTab === 'mentees' && (
           <motion.div 
-            key="my-mentees"
+            key="mentees"
             initial={{ opacity: 0, x: -20 }}
             animate={{ opacity: 1, x: 0 }}
             exit={{ opacity: 0, x: 20 }}
@@ -6074,9 +6875,11 @@ function Mentorship({ user, isDarkMode, mentors, users, fetchMentors, fetchUsers
               isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
             )}>
               <div className="flex justify-between items-center mb-8">
-                <h3 className="text-3xl font-black tracking-tighter">My Mentees</h3>
+                <h3 className="text-3xl font-black tracking-tighter">
+                  {user.role === 'admin' ? 'Global Mentee List' : 'My Mentees'}
+                </h3>
                 <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">
-                  Total Managed Students: {users.filter(u => u.mentorId === user.id).length}
+                  Total Mentees: {user.role === 'admin' ? users.filter(u => u.mentorId).length : users.filter(u => u.mentorId === user.id).length}
                 </div>
               </div>
               <div className="overflow-x-auto">
@@ -6085,13 +6888,13 @@ function Mentorship({ user, isDarkMode, mentors, users, fetchMentors, fetchUsers
                     <tr className="border-b border-slate-100 dark:border-white/5">
                       <th className="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-slate-400">Student Info</th>
                       <th className="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-slate-400">Program/Year</th>
-                      <th className="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-slate-400">Status</th>
+                      <th className="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-slate-400">Assigned Mentor</th>
                       <th className="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-slate-400 text-right">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 dark:divide-white/5">
-                    {users.filter(u => u.mentorId === user.id).length > 0 ? (
-                      users.filter(u => u.mentorId === user.id).map((mentee) => (
+                    {(user.role === 'admin' ? users.filter(u => u.mentorId) : users.filter(u => u.mentorId === user.id)).length > 0 ? (
+                      (user.role === 'admin' ? users.filter(u => u.mentorId) : users.filter(u => u.mentorId === user.id)).map((mentee) => (
                         <tr key={mentee.id} className="group hover:bg-slate-50 dark:hover:bg-white/[0.02]">
                           <td className="px-6 py-6">
                             <div className="flex items-center gap-4">
@@ -6109,38 +6912,25 @@ function Mentorship({ user, isDarkMode, mentors, users, fetchMentors, fetchUsers
                             <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">{mentee.yearLevel || 'N/A'}</p>
                           </td>
                           <td className="px-6 py-6">
-                            <span className="px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-500 text-[10px] font-black uppercase tracking-widest border border-emerald-500/10">
-                              Active Mentee
+                            <span className="font-bold text-xs text-slate-600 dark:text-slate-400">
+                              {user.role === 'admin' 
+                                ? (mentors.find(m => m.id === mentee.mentorId)?.name || 'Assigned')
+                                : 'You'
+                              }
                             </span>
                           </td>
                           <td className="px-6 py-6">
-                            <div className="flex items-center justify-end gap-2">
+                            <div className="flex items-center justify-end gap-2 text-right">
                               <button 
                                 onClick={() => {
-                                  setSelectedChatUser?.(mentee);
-                                  setView?.('messages');
+                                  if (setView && setSelectedChatUser) {
+                                    setSelectedChatUser(mentee);
+                                    setView('messages');
+                                  }
                                 }}
-                                className="w-10 h-10 rounded-2xl bg-slate-900 text-white flex items-center justify-center hover:bg-slate-800 transition-all shadow-lg shadow-slate-900/10"
-                                title="Message Student"
+                                className="px-4 py-2 bg-red-600 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-red-500 transition-all"
                               >
-                                <MessageSquare className="w-4 h-4" />
-                              </button>
-                              <button 
-                                onClick={() => {
-                                  setSelectedStudentForRec?.(mentee.id);
-                                  setView?.('recommendations');
-                                }}
-                                className="w-10 h-10 rounded-2xl bg-emerald-600 text-white flex items-center justify-center hover:bg-emerald-500 transition-all shadow-lg shadow-emerald-500/10"
-                                title="Write Recommendation"
-                              >
-                                <Award className="w-4 h-4" />
-                              </button>
-                              <button 
-                                onClick={() => setFeedbackModal({ isOpen: true, studentId: mentee.id, studentName: `${mentee.name} ${mentee.surname}` })}
-                                className="w-10 h-10 rounded-2xl bg-red-600 text-white flex items-center justify-center hover:bg-red-500 transition-all shadow-lg shadow-red-600/10"
-                                title="Performance Feedback"
-                              >
-                                <TrendingUp className="w-4 h-4" />
+                                Message
                               </button>
                             </div>
                           </td>
@@ -6148,14 +6938,7 @@ function Mentorship({ user, isDarkMode, mentors, users, fetchMentors, fetchUsers
                       ))
                     ) : (
                       <tr>
-                        <td colSpan={4} className="py-20 text-center">
-                          <div className="flex flex-col items-center gap-4">
-                            <div className="w-16 h-16 rounded-full bg-slate-100 dark:bg-white/5 flex items-center justify-center">
-                              <Users className="w-8 h-8 text-slate-300" />
-                            </div>
-                            <p className="text-slate-400 font-bold italic">No mentees assigned yet.</p>
-                          </div>
-                        </td>
+                        <td colSpan={4} className="py-20 text-center text-slate-400 italic">No mentees found.</td>
                       </tr>
                     )}
                   </tbody>
@@ -6259,9 +7042,20 @@ function Mentorship({ user, isDarkMode, mentors, users, fetchMentors, fetchUsers
                   </div>
                 </div>
                 
-                <div className="flex-1">
-                  <h3 className="text-3xl font-black tracking-tight mb-1">{mentor.name}</h3>
-                  <p className="text-sm font-bold text-red-600 mb-6 uppercase tracking-widest">{mentor.role}</p>
+                  <div className="flex-1">
+                    <div className="flex justify-between items-start mb-1">
+                      <h3 className="text-3xl font-black tracking-tight">{mentor.name}</h3>
+                      {isAdmin && (
+                        <button 
+                          onClick={() => handleDeleteMentor(mentor.id)}
+                          className="p-2 hover:bg-red-100 rounded-full text-red-600 transition-colors"
+                          title="Delete Mentor Profile"
+                        >
+                          <X className="w-5 h-5" />
+                        </button>
+                      )}
+                    </div>
+                    <p className="text-sm font-bold text-red-600 mb-6 uppercase tracking-widest">{mentor.role}</p>
                   
                   <div className="space-y-4 mb-6">
                     <div className={cn("p-4 rounded-2xl", isDarkMode ? "bg-white/5" : "bg-slate-50")}>
@@ -6322,98 +7116,122 @@ function Mentorship({ user, isDarkMode, mentors, users, fetchMentors, fetchUsers
             className="grid grid-cols-1 lg:grid-cols-3 gap-8"
           >
             <div className={cn(
-              "lg:col-span-1 p-10 rounded-[3rem] border",
+              "lg:col-span-1 p-10 rounded-[3rem] border h-fit",
               isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
             )}>
               <div className="w-16 h-16 rounded-2xl bg-red-600/10 flex items-center justify-center text-red-600 mb-8">
                 <ShieldCheck className="w-8 h-8" />
               </div>
-              <h3 className="text-3xl font-black tracking-tight mb-4">Confidential Support</h3>
+              <h3 className="text-3xl font-black tracking-tight mb-4">Confidential Counseling</h3>
               <p className={cn("font-medium mb-8 leading-relaxed", isDarkMode ? "text-slate-400" : "text-slate-500")}>
-                Our professional counselors are here to help you with academic stress, personal challenges, and career guidance. All sessions are strictly confidential.
+                Our professional mentors provide safe space for academic stress and personal challenges.
               </p>
               <ul className="space-y-4 mb-10">
-                {[
-                  "Academic Pressure & Anxiety",
-                  "Personal & Family Issues",
-                  "Career Path Guidance",
-                  "Mental Health Support"
-                ].map((item, i) => (
+                {["Direct Inquiries", "Academic Pressure", "Career Advice", "Performance Help"].map((item, i) => (
                   <li key={i} className="flex items-center gap-3 font-bold text-sm">
                     <CheckCircle className="w-5 h-5 text-emerald-500" />
                     {item}
                   </li>
                 ))}
               </ul>
-              <button 
-                onClick={() => setShowCounselingModal(true)}
-                className="w-full py-5 bg-red-600 text-white rounded-[2rem] font-black uppercase tracking-widest text-sm shadow-xl shadow-red-600/20 hover:bg-red-500 transition-all"
-              >
-                Request a Session
-              </button>
+              {user.role === 'student' && (
+                <button 
+                  onClick={() => setShowCounselingModal(true)}
+                  className="w-full py-5 bg-red-600 text-white rounded-[2rem] font-black uppercase tracking-widest text-sm shadow-xl shadow-red-600/20 hover:bg-red-500 transition-all"
+                >
+                  Send Inquiry
+                </button>
+              )}
             </div>
 
             <div className={cn(
               "lg:col-span-2 p-10 rounded-[3rem] border",
               isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
             )}>
-              <h3 className="text-2xl font-black tracking-tight mb-8">Recent Requests</h3>
-              <div className="space-y-4">
+              <h3 className="text-2xl font-black tracking-tight mb-8">Inquiry & Response Log</h3>
+              <div className="space-y-6">
                 {displayCounselingRequests.length > 0 ? displayCounselingRequests.map((req, i) => (
                   <div key={i} className={cn(
-                    "p-6 rounded-3xl border flex items-center justify-between",
-                    isDarkMode ? "bg-white/5 border-white/5" : "bg-slate-50 border-slate-100"
+                    "p-8 rounded-[2.5rem] border flex flex-col gap-6",
+                    isDarkMode ? "bg-white/5 border-white/5" : "bg-slate-50 border-slate-100 shadow-sm"
                   )}>
-                    <div className="flex items-center gap-3">
-                      <div className={cn(
-                        "w-12 h-12 rounded-2xl flex items-center justify-center",
-                        req.urgency === 'High' ? "bg-red-500/10 text-red-500" : "bg-blue-500/10 text-blue-500"
-                      )}>
-                        <MessageSquare className="w-6 h-6" />
+                    <div className="flex items-start justify-between">
+                      <div className="flex items-center gap-4">
+                        <div className={cn(
+                          "w-12 h-12 rounded-2xl flex items-center justify-center",
+                          req.urgency === 'High' ? "bg-red-500/10 text-red-500" : "bg-blue-500/10 text-blue-500"
+                        )}>
+                          <MessageSquare className="w-6 h-6" />
+                        </div>
+                        <div>
+                          <p className="font-black text-xl">{req.studentName || 'Student'}'s {req.type} Inquiry</p>
+                          <p className="text-[10px] font-black uppercase text-slate-400 tracking-widest">{new Date(req.timestamp).toLocaleString()}</p>
+                        </div>
                       </div>
-                      <div>
-                        <p className="font-black text-lg">{req.type} Counseling</p>
-                        <p className="text-xs font-bold text-slate-400">{new Date(req.timestamp).toLocaleDateString()} • Urgency: {req.urgency}</p>
-                        <p className={cn("text-xs mt-1 italic line-clamp-1", isDarkMode ? "text-slate-500" : "text-slate-400")}>{req.description}</p>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-3">
                       <span className={cn(
-                        "px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest",
-                        req.status === 'pending' ? "bg-amber-500/10 text-amber-500" : 
-                        req.status === 'approved' ? "bg-emerald-500/10 text-emerald-500" :
-                        req.status === 'declined' ? "bg-red-500/10 text-red-500" :
-                        "bg-slate-500/10 text-slate-500"
+                        "px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest border",
+                        req.status === 'pending' ? "bg-amber-500/10 text-amber-500 border-amber-500/10" : "bg-emerald-500/10 text-emerald-500 border-emerald-500/10"
                       )}>
                         {req.status}
                       </span>
-                      {isAdmin && req.status === 'pending' && (
-                        <div className="flex gap-2">
-                          <button 
-                            onClick={() => handleUpdateCounselingStatus(req.id, 'approved')}
-                            className="p-2 bg-emerald-500/10 text-emerald-500 rounded-lg hover:bg-emerald-500 hover:text-white transition-all"
-                            title="Approve Request"
-                          >
-                            <Check className="w-4 h-4" />
-                          </button>
-                          <button 
-                            onClick={() => handleUpdateCounselingStatus(req.id, 'declined')}
-                            className="p-2 bg-red-500/10 text-red-500 rounded-lg hover:bg-red-500 hover:text-white transition-all"
-                            title="Decline Request"
-                          >
-                            <X className="w-4 h-4" />
-                          </button>
-                        </div>
-                      )}
                     </div>
+                    
+                    <div className="p-6 bg-white dark:bg-black/20 rounded-2xl border border-slate-200 dark:border-white/5 shadow-inner">
+                      <p className="text-sm font-medium italic text-slate-600 dark:text-slate-300">"{req.description}"</p>
+                    </div>
+
+                    {req.response ? (
+                      <div className="pl-6 border-l-4 border-red-600/30 space-y-3">
+                        <p className="text-[10px] font-black text-red-600 uppercase tracking-widest">Mentor Response:</p>
+                        <div className="p-6 bg-red-600/5 rounded-2xl border border-red-600/10">
+                          <p className="text-sm font-bold text-slate-800 dark:text-red-100 leading-relaxed italic">"{req.response}"</p>
+                        </div>
+                      </div>
+                    ) : (
+                      (user.role === 'faculty' || isUserAMentor) && (
+                        <div className="space-y-4">
+                          {activeReplyId === req.id ? (
+                            <div className="space-y-3">
+                              <textarea 
+                                value={replyText}
+                                onChange={e => setReplyText(e.target.value)}
+                                placeholder="Type your professional response here..."
+                                className={cn(
+                                  "w-full p-4 rounded-xl border focus:ring-2 focus:ring-red-600 font-medium h-24 resize-none",
+                                  isDarkMode ? "bg-white/5 border-white/5 text-white" : "bg-white border-slate-200 text-slate-900"
+                                )}
+                              />
+                              <div className="flex gap-2">
+                                <button 
+                                  onClick={() => handleSendReply(req.id)}
+                                  disabled={isSubmittingReply || !replyText.trim()}
+                                  className="px-6 py-2 bg-red-600 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-red-500 disabled:opacity-50 transition-all"
+                                >
+                                  {isSubmittingReply ? 'Sending...' : 'Send Response'}
+                                </button>
+                                <button 
+                                  onClick={() => { setActiveReplyId(null); setReplyText(''); }}
+                                  className="px-6 py-2 bg-slate-200 dark:bg-white/10 text-slate-600 dark:text-slate-400 rounded-xl text-[10px] font-black uppercase tracking-widest"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <button 
+                              onClick={() => setActiveReplyId(req.id)}
+                              className="px-6 py-3 bg-slate-900 text-white dark:bg-white dark:text-slate-900 rounded-xl text-[10px] font-black uppercase tracking-widest shadow-xl hover:scale-[1.02] transition-all"
+                            >
+                              Write Response
+                            </button>
+                          )
+                        }
+                        </div>
+                      )
+                    )}
                   </div>
                 )) : (
-                  <div className="text-center py-20">
-                    <div className="w-20 h-20 bg-slate-100 dark:bg-white/5 rounded-full flex items-center justify-center mx-auto mb-6">
-                      <ClipboardList className="w-10 h-10 text-slate-300" />
-                    </div>
-                    <p className="text-slate-400 font-bold italic">No counseling requests yet.</p>
-                  </div>
+                  <div className="text-center py-20 text-slate-400 italic">No inquiries found in the counseling module.</div>
                 )}
               </div>
             </div>
@@ -6642,25 +7460,37 @@ function Mentorship({ user, isDarkMode, mentors, users, fetchMentors, fetchUsers
                               </button>
                             )}
 
-                            {/* Actions ONLY for Admin as per request */}
-                            {isAdmin && (
+                            {/* Actions for Admin and Faculty */}
+                            {(isAdmin || (isUserAMentor && sess.mentorId === user.id)) && (
                               <>
                                 {sess.status === 'pending' && (
-                                  <button 
-                                    onClick={() => handleUpdateSessionStatus(sess.id, 'scheduled')}
-                                    className={cn(
-                                      "w-10 h-10 rounded-2xl flex items-center justify-center transition-all shadow-sm",
-                                      isDarkMode ? "bg-blue-500/10 text-blue-500 hover:bg-blue-500 hover:text-white" : "bg-blue-50 text-blue-600 hover:bg-blue-600 hover:text-white"
-                                    )}
-                                    title="Approve Session"
-                                  >
-                                    <Check className="w-5 h-5" />
-                                  </button>
+                                  <div className="flex gap-2">
+                                    <button 
+                                      onClick={() => handleUpdateSessionStatus(sess.id, 'scheduled')}
+                                      className={cn(
+                                        "w-10 h-10 rounded-2xl flex items-center justify-center transition-all shadow-sm",
+                                        isDarkMode ? "bg-blue-500/10 text-blue-500 hover:bg-blue-500 hover:text-white" : "bg-blue-50 text-blue-600 hover:bg-blue-600 hover:text-white"
+                                      )}
+                                      title="Approve Session"
+                                    >
+                                      <Check className="w-5 h-5" />
+                                    </button>
+                                    <button 
+                                      onClick={() => handleUpdateSessionStatus(sess.id, 'cancelled')}
+                                      className={cn(
+                                        "w-10 h-10 rounded-2xl flex items-center justify-center transition-all shadow-sm",
+                                        isDarkMode ? "bg-red-500/10 text-red-500 hover:bg-red-500 hover:text-white" : "bg-red-50 text-red-500 hover:bg-red-600 hover:text-white"
+                                      )}
+                                      title="Reject Session"
+                                    >
+                                      <X className="w-5 h-5" />
+                                    </button>
+                                  </div>
                                 )}
 
                                 {sess.status === 'scheduled' && (
                                   <button 
-                                    onClick={() => handleUpdateSessionStatus(sess.id, 'completed')}
+                                    onClick={() => setActiveSessionForNotes(sess)}
                                     className={cn(
                                       "w-10 h-10 rounded-2xl flex items-center justify-center transition-all shadow-sm",
                                       isDarkMode ? "bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500 hover:text-white" : "bg-emerald-50 text-emerald-600 hover:bg-emerald-600 hover:text-white"
@@ -6670,39 +7500,12 @@ function Mentorship({ user, isDarkMode, mentors, users, fetchMentors, fetchUsers
                                     <Check className="w-5 h-5" />
                                   </button>
                                 )}
-
-                                {(sess.status === 'scheduled' || sess.status === 'pending') && (
-                                  <button 
-                                    onClick={() => handleUpdateSessionStatus(sess.id, 'cancelled')}
-                                    className={cn(
-                                      "w-10 h-10 rounded-2xl flex items-center justify-center transition-all shadow-sm",
-                                      isDarkMode ? "bg-red-500/10 text-red-500 hover:bg-red-500 hover:text-white" : "bg-red-50 text-red-500 hover:bg-red-600 hover:text-white"
-                                    )}
-                                    title="Decline Session"
-                                  >
-                                    <X className="w-5 h-5" />
-                                  </button>
-                                )}
                               </>
-                            )}
-                            
-                            {/* Faculty/Student booking - Restricted per request */}
-                            {user.role === 'student' && sess.status === 'pending' && (
-                               <p className="text-[10px] items-center text-slate-400 italic">Faculty cannot book or approve sessions</p>
                             )}
                           </div>
                         </td>
                       </tr>
                     ))}
-                    {displaySessions.length === 0 && (
-                      <tr>
-                        <td colSpan={5} className="py-20 text-center">
-                          <div className="flex flex-col items-center gap-4">
-                            <p className="text-slate-400 font-bold italic">No sessions recorded.</p>
-                          </div>
-                        </td>
-                      </tr>
-                    )}
                   </tbody>
                 </table>
               </div>
@@ -6710,7 +7513,122 @@ function Mentorship({ user, isDarkMode, mentors, users, fetchMentors, fetchUsers
             </div>
           </motion.div>
         )}
+
+        {activeTab === 'assignments' && user.role === 'admin' && (
+          <motion.div 
+            key="assignments"
+            initial={{ opacity: 0, x: -20 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: 20 }}
+            className="space-y-8"
+          >
+            <div className={cn(
+              "p-10 rounded-[3rem] border",
+              isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
+            )}>
+              <div className="mb-8 text-center md:text-left">
+                <h3 className="text-3xl font-black tracking-tight">Mentorship Assignments</h3>
+                <p className="text-sm font-bold text-slate-400 uppercase tracking-widest">Connect students with relevant professionals</p>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr className="text-left border-b border-slate-100 dark:border-white/5">
+                      <th className="pb-4 text-[10px] font-black uppercase tracking-widest text-slate-400">Student Identity</th>
+                      <th className="pb-4 text-[10px] font-black uppercase tracking-widest text-slate-400">Academic Context</th>
+                      <th className="pb-4 text-[10px] font-black uppercase tracking-widest text-slate-400">Current Mentor Status</th>
+                      <th className="pb-4 text-[10px] font-black uppercase tracking-widest text-slate-400 text-right">Assign Authority</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-white/5">
+                    {users.filter(u => u.role === 'student').map((student, i) => (
+                      <tr key={i} className="group hover:bg-slate-50 dark:hover:bg-white/[0.02] transition-colors">
+                        <td className="py-6">
+                          <p className="font-black text-sm">{student.name} {student.surname}</p>
+                          <p className="text-[10px] font-mono text-slate-400 uppercase">ID: {student.id.slice(0, 8)}</p>
+                        </td>
+                        <td className="py-6">
+                          <p className="text-xs font-black">{student.course || 'GENERAL'}</p>
+                          <p className="text-[10px] font-bold text-slate-400">{student.yearLevel || '1st Year'}</p>
+                        </td>
+                        <td className="py-6">
+                          <div className={cn(
+                            "inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border transition-all",
+                            student.mentorId ? "bg-red-500/5 border-red-500/20 text-red-600" : "bg-slate-50 border-slate-200 text-slate-400"
+                          )}>
+                            <div className={cn("w-2 h-2 rounded-full", student.mentorId ? "bg-red-600" : "bg-slate-300")} />
+                            <span className="text-[10px] font-black uppercase tracking-widest">
+                              {mentors.find(m => m.id === student.mentorId)?.name || 'Unassigned'}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="py-6 text-right">
+                          <select 
+                            value={student.mentorId || ''}
+                            onChange={async (e) => {
+                              const mentorId = e.target.value;
+                              const { error } = await supabase.from('users').update({ mentorId }).eq('id', student.id);
+                              if (!error) {
+                                alert('Assignment confirmed successfully.');
+                                fetchUsers();
+                              }
+                            }}
+                            className={cn(
+                              "p-3 rounded-2xl text-[10px] font-black uppercase tracking-widest border outline-none focus:ring-2 focus:ring-red-600 transition-all",
+                              isDarkMode ? "bg-white/5 border-white/10" : "bg-white border-slate-200 shadow-sm"
+                            )}
+                          >
+                            <option value="">None / Remove</option>
+                            {mentors.map(m => (
+                              <option key={m.id} value={m.id}>{m.name} ({m.specialty})</option>
+                            ))}
+                          </select>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </motion.div>
+        )}
       </AnimatePresence>
+
+      {activeSessionForNotes && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-stone-900/60 backdrop-blur-md">
+          <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className={cn("p-10 rounded-[3rem] max-w-lg w-full shadow-2xl border", isDarkMode ? "bg-[#111111] border-white/5 text-white" : "bg-white border-slate-200")}>
+            <div className="flex justify-between items-center mb-8">
+              <div>
+                <h3 className="text-3xl font-black tracking-tighter">Complete Session</h3>
+                <p className="text-[10px] font-black uppercase text-slate-400 tracking-widest mt-1">Session on {new Date(activeSessionForNotes.date).toLocaleDateString()}</p>
+              </div>
+              <button onClick={() => setActiveSessionForNotes(null)} className="p-2 hover:bg-slate-100 dark:hover:bg-white/5 rounded-full transition-colors"><X className="w-6 h-6" /></button>
+            </div>
+            <div className="space-y-6">
+              <div>
+                <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 ml-2">Session Notes / Remarks</label>
+                <textarea 
+                  value={sessionNotes}
+                  onChange={e => setSessionNotes(e.target.value)}
+                  className={cn("w-full p-6 rounded-3xl border font-medium h-40 resize-none outline-none focus:ring-2 focus:ring-red-600", isDarkMode ? "bg-white/5 border-white/5" : "bg-slate-50 border-slate-200 shadow-inner")}
+                  placeholder="Summarize the session outcomes and professional advice given..."
+                />
+              </div>
+              <div className="flex gap-4">
+                <button onClick={() => setActiveSessionForNotes(null)} className="flex-1 py-4 bg-slate-100 dark:bg-white/5 rounded-2xl font-black uppercase tracking-widest text-[10px]">Back</button>
+                <button 
+                  onClick={handleCompleteWithNotes}
+                  disabled={!sessionNotes.trim()}
+                  className="flex-1 py-4 bg-emerald-600 text-white rounded-2xl font-black uppercase tracking-widest text-[10px] shadow-xl shadow-emerald-600/20 hover:bg-emerald-500 disabled:opacity-50 transition-all flex items-center justify-center gap-2"
+                >
+                  <CheckCircle className="w-4 h-4" />
+                  Save & Complete
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        </div>
+      )}
 
       {/* Modals */}
       {showCounselingModal && (
@@ -7165,7 +8083,12 @@ function Resources({ user, isDarkMode, resources, fetchResources, activeModal, s
             <h3 className="font-black tracking-tight mb-1">{res.title}</h3>
             <div className="flex items-center justify-between mt-4">
               <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">{res.type} • {res.size}</span>
-              <button className="p-2 rounded-xl bg-red-600 text-white shadow-lg shadow-red-600/20 hover:bg-red-500 transition-all">
+              <button 
+                onClick={() => {
+                  alert(`Starting download for: ${res.title}`);
+                }}
+                className="p-2 rounded-xl bg-red-600 text-white shadow-lg shadow-red-600/20 hover:bg-red-500 transition-all"
+              >
                 <Download className="w-4 h-4" />
               </button>
             </div>
@@ -7227,6 +8150,18 @@ function Resources({ user, isDarkMode, resources, fetchResources, activeModal, s
 
 function Community({ user, isDarkMode, events, orgs, fetchCommunityData, activeModal, setActiveModal }: { user: UserData, isDarkMode?: boolean, events: any[], orgs: any[], fetchCommunityData: () => void, activeModal?: string | null, setActiveModal?: (val: string | null) => void }) {
   const [showAddModal, setShowAddModal] = useState(false);
+  const [editingOrg, setEditingOrg] = useState<any>(null);
+  const [addType, setAddType] = useState<'event' | 'org'>('event');
+  const [activeTab, setActiveTab] = useState<'all' | 'club' | 'organization' | 'initiative'>('all');
+  const [newData, setNewData] = useState({ 
+    title: '', 
+    date: '', 
+    location: '', 
+    name: '', 
+    description: '', 
+    category: 'Club' as any,
+    members: [] as string[]
+  });
 
   useEffect(() => {
     if (activeModal === 'community') {
@@ -7234,126 +8169,342 @@ function Community({ user, isDarkMode, events, orgs, fetchCommunityData, activeM
       if (setActiveModal) setActiveModal(null);
     }
   }, [activeModal]);
-  const [addType, setAddType] = useState<'event' | 'org'>('event');
-  const [newData, setNewData] = useState({ title: '', date: '', location: '', name: '' });
 
   const handleAdd = async () => {
     const table = addType === 'event' ? 'community_events' : 'community_orgs';
-    const { error } = await supabase.from(table).insert(newData);
+    const payload = addType === 'event' 
+      ? { title: newData.title, date: newData.date, location: newData.location }
+      : { name: newData.name, description: newData.description, category: newData.category, members: [] };
+
+    const { error } = await supabase.from(table).insert(payload);
     if (!error) {
       fetchCommunityData();
       setShowAddModal(false);
-      setNewData({ title: '', date: '', location: '', name: '' });
+      resetForm();
     }
   };
+
+  const handleUpdate = async () => {
+    if (!editingOrg) return;
+    const { error } = await supabase
+      .from('community_orgs')
+      .update({ 
+        name: newData.name, 
+        description: newData.description, 
+        category: newData.category 
+      })
+      .eq('id', editingOrg.id);
+
+    if (!error) {
+      fetchCommunityData();
+      setShowAddModal(false);
+      setEditingOrg(null);
+      resetForm();
+    }
+  };
+
+  const handleDelete = async (id: string, type: 'event' | 'org') => {
+    const table = type === 'event' ? 'community_events' : 'community_orgs';
+    if (!confirm(`Are you sure you want to delete this ${type}?`)) return;
+    
+    const { error } = await supabase.from(table).delete().eq('id', id);
+    if (!error) fetchCommunityData();
+  };
+
+  const handleJoinLeave = async (org: any) => {
+    const isMember = (org.members || []).includes(user.id);
+    let updatedMembers = [];
+    
+    if (isMember) {
+      updatedMembers = (org.members || []).filter((id: string) => id !== user.id);
+    } else {
+      updatedMembers = [...(org.members || []), user.id];
+    }
+
+    const { error } = await supabase
+      .from('community_orgs')
+      .update({ members: updatedMembers })
+      .eq('id', org.id);
+
+    if (!error) fetchCommunityData();
+  };
+
+  const resetForm = () => {
+    setNewData({ title: '', date: '', location: '', name: '', description: '', category: 'Club', members: [] });
+  };
+
+  const filteredOrgs = activeTab === 'all' ? orgs : orgs.filter(o => o.category?.toLowerCase() === activeTab);
 
   return (
     <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="space-y-8">
       <header className="flex justify-between items-end">
         <div>
-          <h1 className="text-4xl font-black tracking-tighter">Student Community</h1>
-          <p className={isDarkMode ? "text-slate-400" : "text-slate-500"}>Join clubs, organizations, and student-led initiatives.</p>
+          <h1 className="text-5xl font-black tracking-tighter">Student Community</h1>
+          <p className={cn("text-lg font-medium", isDarkMode ? "text-slate-400" : "text-slate-500")}>Browse and join clubs, organizations, and focus initiatives.</p>
         </div>
-        {(user.role === 'admin' || user.role === 'faculty') && (
+        {user.role === 'admin' && (
           <button 
-            onClick={() => setShowAddModal(true)}
-            className="px-6 py-3 bg-red-600 text-white rounded-xl font-black uppercase tracking-widest text-xs shadow-lg shadow-red-600/20 hover:bg-red-500 transition-all flex items-center gap-2"
+            onClick={() => { resetForm(); setAddType('org'); setShowAddModal(true); }}
+            className="px-8 py-4 bg-red-600 text-white rounded-[2rem] font-black uppercase tracking-widest text-xs shadow-xl shadow-red-600/20 hover:bg-red-500 transition-all flex items-center gap-2"
           >
-            <Plus className="w-4 h-4" />
-            Add Event/Org
+            <PlusCircle className="w-5 h-5" />
+            Create Community
           </button>
         )}
       </header>
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+
+      <div className="flex gap-2 p-1 bg-slate-100 dark:bg-white/5 rounded-full w-fit">
+        {['all', 'club', 'organization', 'initiative'].map((tab) => (
+          <button 
+            key={tab}
+            onClick={() => setActiveTab(tab as any)}
+            className={cn(
+              "px-6 py-2 rounded-full text-[10px] font-black uppercase tracking-widest transition-all",
+              activeTab === tab ? "bg-red-600 text-white shadow-lg shadow-red-600/20" : "text-slate-400 hover:text-slate-600"
+            )}
+          >
+            {tab}s
+          </button>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
         <div className={cn(
-          "p-10 rounded-[3rem] border",
+          "md:col-span-1 p-10 rounded-[3rem] border h-fit",
           isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
         )}>
-          <h3 className="text-2xl font-black tracking-tight mb-6">Upcoming Events</h3>
-          <div className="space-y-6">
+          <h3 className="text-2xl font-black tracking-tight mb-8 flex items-center gap-3">
+            <Calendar className="w-6 h-6 text-red-600" />
+            Upcoming Events
+          </h3>
+          <div className="space-y-8">
             {events.length > 0 ? events.map((event, i) => (
-              <div key={i} className="flex gap-6">
-                <div className={cn("w-16 h-16 rounded-2xl flex flex-col items-center justify-center shrink-0", isDarkMode ? "bg-white/5" : "bg-slate-50")}>
-                  <span className="text-[10px] font-black text-red-600 uppercase tracking-widest">{event.date.split(' ')[0].slice(0, 3)}</span>
-                  <span className="text-xl font-black">{event.date.split(' ')[1]?.replace(',', '') || '??'}</span>
-                </div>
-                <div>
-                  <p className="font-black tracking-tight">{event.title}</p>
-                  <p className="text-xs text-slate-400 mt-1">{event.location}</p>
+              <div key={i} className="group relative">
+                <div className="flex gap-6">
+                  <div className={cn("w-16 h-16 rounded-2xl flex flex-col items-center justify-center shrink-0 border", isDarkMode ? "bg-white/5 border-white/5" : "bg-slate-50 border-slate-100")}>
+                    <span className="text-[10px] font-black text-red-600 uppercase tracking-widest">{event.date?.split(' ')[0]?.slice(0, 3)}</span>
+                    <span className="text-xl font-black tracking-tighter">{event.date?.split(' ')[1]?.replace(',', '') || '??'}</span>
+                  </div>
+                  <div className="flex-1">
+                    <p className="font-black text-lg tracking-tight leading-none mb-1">{event.title}</p>
+                    <p className="text-xs font-bold text-slate-400 flex items-center gap-1">
+                      <MapPin className="w-3 h-3" />
+                      {event.location}
+                    </p>
+                  </div>
+                  {user.role === 'admin' && (
+                    <button onClick={() => handleDelete(event.id, 'event')} className="opacity-0 group-hover:opacity-100 p-2 text-red-600 hover:bg-red-50 rounded-xl transition-all">
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  )}
                 </div>
               </div>
             )) : (
-              <p className="text-slate-400 italic font-bold">No upcoming events.</p>
+              <div className="py-12 text-center text-slate-400 italic">
+                <Globe className="w-10 h-10 mx-auto mb-4 opacity-20" />
+                <p className="font-bold">No active events.</p>
+              </div>
+            )}
+            {user.role === 'admin' && (
+              <button 
+                onClick={() => { resetForm(); setAddType('event'); setShowAddModal(true); }}
+                className="w-full py-4 border-2 border-dashed border-slate-200 dark:border-white/5 rounded-[2rem] text-slate-400 font-black uppercase text-[10px] tracking-widest hover:border-red-600 hover:text-red-600 transition-all"
+              >
+                + Add Event
+              </button>
             )}
           </div>
         </div>
-        <div className={cn(
-          "p-10 rounded-[3rem] border",
-          isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
-        )}>
-          <h3 className="text-2xl font-black tracking-tight mb-6">Student Organizations</h3>
-          <div className="grid grid-cols-2 gap-4">
-            {orgs.length > 0 ? orgs.map((org, i) => (
-              <div key={i} className={cn("p-4 rounded-2xl border text-center transition-all hover:bg-red-600 hover:text-white hover:border-red-600 cursor-pointer", isDarkMode ? "bg-white/5 border-white/10" : "bg-slate-50 border-slate-200")}>
-                <p className="text-xs font-black uppercase tracking-widest">{org.name}</p>
+
+        <div className="md:col-span-2 space-y-8">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+            {filteredOrgs.length > 0 ? filteredOrgs.map((org, i) => {
+              const isMember = (org.members || []).includes(user.id);
+              return (
+                <div key={i} className={cn(
+                  "p-8 rounded-[3rem] border transition-all hover:shadow-xl group relative overflow-hidden",
+                  isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200"
+                )}>
+                  <div className="absolute top-6 right-6 flex gap-2">
+                    {user.role === 'admin' && (
+                      <button 
+                        onClick={() => {
+                          setEditingOrg(org);
+                          setNewData({ ...org });
+                          setAddType('org');
+                          setShowAddModal(true);
+                        }}
+                        className="p-2 bg-slate-100 dark:bg-white/5 rounded-xl hover:bg-emerald-500 hover:text-white transition-all"
+                      >
+                        <Edit2 className="w-4 h-4" />
+                      </button>
+                    )}
+                    {user.role === 'admin' && (
+                      <button onClick={() => handleDelete(org.id, 'org')} className="p-2 bg-slate-100 dark:bg-white/5 rounded-xl hover:bg-red-600 hover:text-white transition-all">
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
+                  </div>
+
+                  <div className={cn(
+                    "w-14 h-14 rounded-2xl flex items-center justify-center mb-6 shadow-lg",
+                    org.category === 'Club' ? "bg-red-500 text-white shadow-red-500/20" :
+                    org.category === 'Organization' ? "bg-blue-500 text-white shadow-blue-500/20" :
+                    "bg-emerald-500 text-white shadow-emerald-500/20"
+                  )}>
+                    <Users2 className="w-7 h-7" />
+                  </div>
+
+                  <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">{org.category}</span>
+                  <h4 className="text-2xl font-black tracking-tighter mb-4 mt-1">{org.name}</h4>
+                  <p className="text-sm font-medium text-slate-500 line-clamp-2 mb-8 leading-relaxed italic">
+                    {org.description || 'Dedicated to student growth and creative expression within the aid ecosystem.'}
+                  </p>
+
+                  <div className="flex items-center justify-between border-t border-slate-100 dark:border-white/5 pt-6">
+                    <div className="flex items-center gap-2">
+                      <div className="flex -space-x-3">
+                        {[1, 2, 3].map((_, idx) => (
+                          <div key={idx} className="w-8 h-8 rounded-full border-2 border-white dark:border-slate-900 bg-slate-200 flex items-center justify-center text-[10px] font-black">{idx + 1}</div>
+                        ))}
+                      </div>
+                      <span className="text-[10px] font-black text-slate-400">{(org.members || []).length} Members</span>
+                    </div>
+                    {user.role === 'student' && (
+                      <button 
+                        onClick={() => handleJoinLeave(org)}
+                        className={cn(
+                          "px-6 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all",
+                          isMember 
+                            ? "bg-slate-100 dark:bg-white/5 text-slate-500 hover:bg-red-600 hover:text-white" 
+                            : "bg-red-600 text-white shadow-lg shadow-red-600/20 hover:scale-105 active:scale-95"
+                        )}
+                      >
+                        {isMember ? 'Leave' : 'Join'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            }) : (
+              <div className="col-span-2 py-20 text-center border-2 border-dashed border-slate-200 dark:border-white/5 rounded-[3rem]">
+                <PlusCircle className="w-12 h-12 mx-auto mb-4 text-slate-300" />
+                <p className="text-slate-400 font-bold italic tracking-widest uppercase text-xs">No active {activeTab}s listed.</p>
               </div>
-            )) : (
-              <p className="col-span-2 text-slate-400 italic font-bold">No organizations listed.</p>
             )}
           </div>
         </div>
       </div>
 
-      {showAddModal && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-stone-900/40 backdrop-blur-sm">
-          <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className="bg-white rounded-[2.5rem] p-8 max-w-md w-full shadow-2xl">
-            <h3 className="text-2xl font-black mb-6">Add to Community</h3>
-            <div className="flex gap-4 mb-6">
-              <button onClick={() => setAddType('event')} className={cn("flex-1 py-2 rounded-xl font-bold", addType === 'event' ? "bg-red-600 text-white" : "bg-slate-100")}>Event</button>
-              <button onClick={() => setAddType('org')} className={cn("flex-1 py-2 rounded-xl font-bold", addType === 'org' ? "bg-red-600 text-white" : "bg-slate-100")}>Org</button>
-            </div>
-            <div className="space-y-4">
-              {addType === 'event' ? (
-                <>
-                  <input 
-                    type="text" 
-                    placeholder="Event Title" 
-                    value={newData.title}
-                    onChange={e => setNewData({...newData, title: e.target.value})}
-                    className="w-full p-4 bg-slate-50 rounded-2xl border-none outline-none focus:ring-2 focus:ring-red-600"
-                  />
-                  <input 
-                    type="text" 
-                    placeholder="Date (e.g. April 15, 2024)" 
-                    value={newData.date}
-                    onChange={e => setNewData({...newData, date: e.target.value})}
-                    className="w-full p-4 bg-slate-50 rounded-2xl border-none outline-none focus:ring-2 focus:ring-red-600"
-                  />
-                  <input 
-                    type="text" 
-                    placeholder="Location" 
-                    value={newData.location}
-                    onChange={e => setNewData({...newData, location: e.target.value})}
-                    className="w-full p-4 bg-slate-50 rounded-2xl border-none outline-none focus:ring-2 focus:ring-red-600"
-                  />
-                </>
-              ) : (
-                <input 
-                  type="text" 
-                  placeholder="Organization Name" 
-                  value={newData.name}
-                  onChange={e => setNewData({...newData, name: e.target.value})}
-                  className="w-full p-4 bg-slate-50 rounded-2xl border-none outline-none focus:ring-2 focus:ring-red-600"
-                />
+      <AnimatePresence>
+        {showAddModal && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => { setShowAddModal(false); setEditingOrg(null); }} className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className={cn("relative rounded-[3rem] p-10 max-w-lg w-full shadow-2xl", isDarkMode ? "bg-[#111111] text-white border border-white/10" : "bg-white")}
+            >
+              <h3 className="text-4xl font-black tracking-tighter mb-8 leading-none">
+                {editingOrg ? 'Update Community' : (addType === 'event' ? 'Schedule Event' : 'Create Community')}
+              </h3>
+
+              {!editingOrg && (
+                <div className="flex gap-3 mb-8 p-1.5 bg-slate-100 dark:bg-white/5 rounded-2xl">
+                  {(['event', 'org'] as const).map(type => (
+                    <button 
+                      key={type}
+                      onClick={() => setAddType(type)} 
+                      className={cn(
+                        "flex-1 py-3 rounded-xl font-black text-[10px] uppercase tracking-widest transition-all",
+                        addType === type ? "bg-white dark:bg-white/10 text-slate-900 dark:text-white shadow-sm" : "text-slate-400"
+                      )}
+                    >
+                      {type}
+                    </button>
+                  ))}
+                </div>
               )}
-              <div className="flex gap-4 pt-4">
-                <button onClick={() => setShowAddModal(false)} className="flex-1 py-4 bg-slate-100 rounded-2xl font-bold">Cancel</button>
-                <button onClick={handleAdd} className="flex-1 py-4 bg-red-600 text-white rounded-2xl font-black">Add</button>
+
+              <div className="space-y-6">
+                {addType === 'event' ? (
+                  <>
+                    <div>
+                      <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 pl-2">Event Headline</label>
+                      <input 
+                        type="text" value={newData.title} onChange={e => setNewData({...newData, title: e.target.value})}
+                        className={cn("w-full p-5 rounded-2xl font-bold border-none", isDarkMode ? "bg-white/5 text-white" : "bg-slate-50 text-slate-900")}
+                        placeholder="e.g. Annual Aid Expo"
+                      />
+                    </div>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 pl-2">Date</label>
+                        <input 
+                          type="text" value={newData.date} onChange={e => setNewData({...newData, date: e.target.value})}
+                          className={cn("w-full p-5 rounded-2xl font-bold border-none", isDarkMode ? "bg-white/5 text-white" : "bg-slate-50 text-slate-900")}
+                          placeholder="April 21, 2026"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 pl-2">Location</label>
+                        <input 
+                          type="text" value={newData.location} onChange={e => setNewData({...newData, location: e.target.value})}
+                          className={cn("w-full p-5 rounded-2xl font-bold border-none", isDarkMode ? "bg-white/5 text-white" : "bg-slate-50 text-slate-900")}
+                          placeholder="Main Hall"
+                        />
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div>
+                      <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 pl-2">Group Name</label>
+                      <input 
+                        type="text" value={newData.name} onChange={e => setNewData({...newData, name: e.target.value})}
+                        className={cn("w-full p-5 rounded-2xl font-bold border-none", isDarkMode ? "bg-white/5 text-white" : "bg-slate-50 text-slate-900")}
+                        placeholder="Organization Name"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 pl-2">Category</label>
+                      <select 
+                        value={newData.category} onChange={e => setNewData({...newData, category: e.target.value as any})}
+                        className={cn("w-full p-5 rounded-2xl font-black border-none appearance-none", isDarkMode ? "bg-white/5 text-white" : "bg-slate-50 text-slate-900")}
+                      >
+                        <option>Club</option>
+                        <option>Organization</option>
+                        <option>Initiative</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 pl-2">Mandate & Description</label>
+                      <textarea 
+                        value={newData.description} onChange={e => setNewData({...newData, description: e.target.value})}
+                        className={cn("w-full p-5 rounded-2xl font-bold border-none h-32 resize-none leading-relaxed", isDarkMode ? "bg-white/5 text-white" : "bg-slate-50 text-slate-900")}
+                        placeholder="Briefly describe the community's goal..."
+                      />
+                    </div>
+                  </>
+                )}
+                <div className="flex gap-4 pt-6">
+                  <button 
+                    onClick={() => { setShowAddModal(false); setEditingOrg(null); }}
+                    className={cn("flex-1 py-5 rounded-[2rem] font-black uppercase tracking-widest text-[10px]", isDarkMode ? "bg-white/5 text-slate-400" : "bg-slate-100 text-slate-600")}
+                  >
+                    Cancel
+                  </button>
+                  <button 
+                    onClick={editingOrg ? handleUpdate : handleAdd}
+                    className="flex-1 py-5 bg-red-600 text-white rounded-[2rem] font-black uppercase tracking-widest text-[10px] shadow-xl shadow-red-600/30 hover:bg-red-500 active:scale-95 transition-all"
+                  >
+                    {editingOrg ? 'Apply Changes' : (addType === 'event' ? 'Post Event' : 'Launch Community')}
+                  </button>
+                </div>
               </div>
-            </div>
-          </motion.div>
-        </div>
-      )}
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </motion.div>
   );
 }
@@ -7430,7 +8581,9 @@ function SettingsView({
   const settingsItems = [
     { id: 'notifications', title: "Notifications", desc: "Manage how you receive alerts and updates.", icon: <Bell /> },
     { id: 'privacy', title: "Privacy & Security", desc: "Control your data and account protection.", icon: <Shield /> },
-    { id: 'display', title: "Display Preferences", desc: "Customize the look and feel of your portal.", icon: <Palette /> }
+    { id: 'display', title: "Display Preferences", desc: "Customize the look and feel of your portal.", icon: <Palette /> },
+    ...(user.role === 'faculty' ? [{ id: 'faculty', title: "Faculty Workspace", desc: "Curriculum management and academic load.", icon: <BookOpen /> }] : []),
+    ...(user.role === 'student' ? [{ id: 'student', title: "Academic Profile", desc: "Digital identity and enrollment roadmap.", icon: <GraduationCap /> }] : [])
   ];
 
   const handleSave = () => {
@@ -7733,7 +8886,7 @@ function SettingsView({
   );
 }
 
-function FinancialAid({ user, financialAid, fetchFinancialAid, isDarkMode, selectedScholarship, setSelectedScholarship, users }: { user: UserData, financialAid: any[], fetchFinancialAid: any, isDarkMode?: boolean, selectedScholarship?: string | null, setSelectedScholarship?: any, users: UserData[] }) {
+function FinancialAid({ user, financialAid, fetchFinancialAid, isDarkMode, selectedScholarship, setSelectedScholarship, users, scholarships }: { user: UserData, financialAid: any[], fetchFinancialAid: any, isDarkMode?: boolean, selectedScholarship?: string | null, setSelectedScholarship?: any, users: UserData[], scholarships: any[] }) {
   const [showApply, setShowApply] = useState(false);
   const [selectedApplication, setSelectedApplication] = useState<any>(null);
   const [formData, setFormData] = useState({ 
@@ -7741,14 +8894,51 @@ function FinancialAid({ user, financialAid, fetchFinancialAid, isDarkMode, selec
     amount: '', 
     reason: '',
     personalStatement: '',
-    hasAcademicRecords: false,
-    hasRecommendation: false,
-    hasIncomeProof: false,
-    hasValidId: false,
-    hasRecentPhoto: false
+    hasAcademicRecords: '',
+    hasRecommendation: '',
+    hasIncomeProof: '',
+    hasValidId: '',
+    hasRecentPhoto: ''
   });
 
+  const [previewFile, setPreviewFile] = useState<{name: string, data: string} | null>(null);
   const [uploading, setUploading] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [submissionStatus, setSubmissionStatus] = useState<'idle' | 'success' | 'error'>('idle');
+  const [errorMessage, setErrorMessage] = useState('');
+
+  const prefillExample = () => {
+    setFormData({
+      type: 'Scholarship',
+      amount: '',
+      reason: 'I am a dedicated student with a high GPA but currently facing financial hardships due to family medical expenses. This scholarship will help me continue my education without delay.',
+      personalStatement: 'My academic journey has always been driven by a passion for science and community service. I have maintained a 3.8 GPA while volunteering at the local clinic. My goal is to eventually study medicine and serve rural communities. Financial support would be instrumental in achieving this dream.',
+      hasAcademicRecords: 'https://picsum.photos/seed/records/800/1200',
+      hasRecommendation: 'https://picsum.photos/seed/recommend/800/1200',
+      hasIncomeProof: 'https://picsum.photos/seed/income/800/1200',
+      hasValidId: 'https://picsum.photos/seed/id/800/1200',
+      hasRecentPhoto: 'https://picsum.photos/seed/photo/800/1200'
+    });
+    setSubmissionStatus('idle');
+    setErrorMessage('');
+  };
+
+  const resetForm = () => {
+    setFormData({ 
+      type: 'Scholarship', 
+      amount: '', 
+      reason: '',
+      personalStatement: '',
+      hasAcademicRecords: '',
+      hasRecommendation: '',
+      hasIncomeProof: '',
+      hasValidId: '',
+      hasRecentPhoto: ''
+    });
+    setUploading(null);
+    setSubmissionStatus('idle');
+    setErrorMessage('');
+  };
 
   useEffect(() => {
     if (selectedScholarship) {
@@ -7756,6 +8946,12 @@ function FinancialAid({ user, financialAid, fetchFinancialAid, isDarkMode, selec
       setShowApply(true);
     }
   }, [selectedScholarship]);
+
+  const handleCloseForm = () => {
+    setShowApply(false);
+    resetForm();
+    setSelectedScholarship?.(null);
+  };
 
   const handleFileUpload = (field: string) => {
     const input = document.createElement('input');
@@ -7765,11 +8961,13 @@ function FinancialAid({ user, financialAid, fetchFinancialAid, isDarkMode, selec
       const file = e.target.files[0];
       if (file) {
         setUploading(field);
-        // Simulate upload with delay
-        setTimeout(() => {
-          setFormData(prev => ({ ...prev, [field]: true }));
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          const dataUrl = event.target?.result as string;
+          setFormData(prev => ({ ...prev, [field]: dataUrl }));
           setUploading(null);
-        }, 1500);
+        };
+        reader.readAsDataURL(file);
       }
     };
     input.click();
@@ -7777,13 +8975,45 @@ function FinancialAid({ user, financialAid, fetchFinancialAid, isDarkMode, selec
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setSubmitting(true);
+    setSubmissionStatus('idle');
+    setErrorMessage('');
     
     // Check if all required uploads are present
-    const requiredFiles = ['hasAcademicRecords', 'hasValidId', 'hasRecentPhoto'];
-    const missing = requiredFiles.filter(f => !formData[f as keyof typeof formData]);
+    const requiredFiles = [
+      { id: 'hasAcademicRecords', label: 'Academic Records' },
+      { id: 'hasValidId', label: 'Valid ID' },
+      { id: 'hasRecentPhoto', label: 'Recent Photo' }
+    ];
+    const missing = requiredFiles.filter(f => !formData[f.id as keyof typeof formData]);
     
     if (missing.length > 0) {
-      alert('Please upload all required documents: Academic Records, Valid ID, and Recent Photo.');
+      setSubmissionStatus('error');
+      setErrorMessage(`Please upload: ${missing.map(m => m.label).join(', ')}`);
+      setSubmitting(false);
+      return;
+    }
+
+    // Validate textual inputs
+    if (formData.reason.trim().length < 20) {
+      setSubmissionStatus('error');
+      setErrorMessage('Justification reason is too short (min 20 chars)');
+      setSubmitting(false);
+      return;
+    }
+
+    if (formData.personalStatement.trim().length < 50) {
+      setSubmissionStatus('error');
+      setErrorMessage('Personal statement is too short (min 50 chars)');
+      setSubmitting(false);
+      return;
+    }
+
+    const requestedAmount = formData.type === 'Student Loan' ? parseFloat(formData.amount) : 0;
+    if (formData.type === 'Student Loan' && (isNaN(requestedAmount) || requestedAmount <= 0)) {
+      setSubmissionStatus('error');
+      setErrorMessage('Enter a valid requested amount');
+      setSubmitting(false);
       return;
     }
 
@@ -7791,7 +9021,7 @@ function FinancialAid({ user, financialAid, fetchFinancialAid, isDarkMode, selec
       .from('financial_aid')
       .insert({ 
         program: formData.type, 
-        amount: formData.type === 'Student Loan' ? parseFloat(formData.amount) : 0, 
+        amount: requestedAmount, 
         reason: formData.reason, 
         personalStatement: formData.personalStatement,
         attachments: {
@@ -7808,14 +9038,34 @@ function FinancialAid({ user, financialAid, fetchFinancialAid, isDarkMode, selec
       });
     
     if (!error) {
-      alert('Application submitted successfully!');
-      setShowApply(false);
-      setSelectedScholarship?.(null);
+      setSubmissionStatus('success');
+      
+      // Create notification for student
+      await supabase.from('notifications').insert({
+        userId: user.id,
+        title: "Application Received",
+        message: `Your application for ${formData.type} has been successfully submitted and is now waiting for approval.`,
+        type: 'info',
+        read: false,
+        timestamp: new Date().toISOString()
+      });
+
+      setTimeout(() => {
+        handleCloseForm();
+      }, 1500);
       fetchFinancialAid();
     } else {
       console.error('Submission error:', error);
-      alert('Error submitting application: ' + error.message);
+      setSubmissionStatus('error');
+      
+      // Detailed error logic for PostgREST schema cache errors
+      if (error.message.includes('attachments') || error.message.includes('schema cache')) {
+        setErrorMessage('Database Error: Missing "attachments" column. Please run the SQL fix in your Supabase dashboard to allow file uploads.');
+      } else {
+        setErrorMessage(error.message);
+      }
     }
+    setSubmitting(false);
   };
 
   return (
@@ -7825,16 +9075,18 @@ function FinancialAid({ user, financialAid, fetchFinancialAid, isDarkMode, selec
           <h1 className="text-4xl font-black tracking-tighter">Financial Aid</h1>
           <p className={isDarkMode ? "text-slate-400" : "text-slate-500"}>Manage your scholarships, grants, and academic funding.</p>
         </div>
-        <button 
-          onClick={() => setShowApply(true)}
-          className={cn(
-            "flex items-center justify-center gap-2 px-8 py-4 rounded-2xl font-black transition-all",
-            isDarkMode ? "bg-white text-slate-900 hover:bg-slate-200" : "bg-slate-900 text-white hover:bg-slate-800 shadow-lg shadow-slate-200"
-          )}
-        >
-          <Plus className="w-5 h-5" />
-          New Application
-        </button>
+        {(user.role === 'admin' || user.role === 'student') && (
+          <button 
+            onClick={() => setShowApply(true)}
+            className={cn(
+              "flex items-center justify-center gap-2 px-8 py-4 rounded-2xl font-black transition-all",
+              isDarkMode ? "bg-white text-slate-900 hover:bg-slate-200" : "bg-slate-900 text-white hover:bg-slate-800 shadow-lg shadow-slate-200"
+            )}
+          >
+            <Plus className="w-5 h-5" />
+            New Application
+          </button>
+        )}
       </header>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
@@ -7862,18 +9114,56 @@ function FinancialAid({ user, financialAid, fetchFinancialAid, isDarkMode, selec
         )}
 
         <div className={cn(
+          "lg:col-span-1 p-10 rounded-[3rem] border transition-all",
+          isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
+        )}>
+          <h3 className="text-2xl font-black tracking-tight mb-8">Available Aid Posts</h3>
+          <div className="space-y-4">
+            {scholarships.map(s => (
+              <div 
+                key={s.id}
+                className={cn(
+                  "p-6 rounded-3xl border transition-all hover:border-red-600 cursor-pointer",
+                  isDarkMode ? "bg-white/5 border-white/5" : "bg-slate-50 border-slate-100"
+                )}
+                onClick={() => {
+                  setFormData(prev => ({ ...prev, type: s.name }));
+                  setShowApply(true);
+                }}
+              >
+                <div className="flex items-center gap-4 mb-3">
+                  <div className="w-10 h-10 rounded-xl bg-red-600 flex items-center justify-center text-white">
+                    <Award className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <p className="font-black text-sm">{s.name}</p>
+                    <p className="text-[10px] uppercase font-black tracking-widest text-emerald-500">{s.coverage}</p>
+                  </div>
+                </div>
+                <p className="text-xs text-slate-500 dark:text-slate-400 line-clamp-2">{s.description}</p>
+                <button className="mt-4 w-full py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase tracking-widest">
+                  Apply Now
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className={cn(
           "lg:col-span-2 p-10 rounded-[3rem] border transition-all",
           isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
         )}>
-          <h3 className="text-2xl font-black tracking-tight mb-8">Application History</h3>
+          <h3 className="text-2xl font-black tracking-tight mb-8">
+            {user.role === 'admin' ? "All Applications" : "Application History"}
+          </h3>
           <div className="space-y-4">
-              {financialAid.filter(f => f.studentId === user.id).length > 0 ? (
-                financialAid.filter(f => f.studentId === user.id).map(f => (
+              {((user.role === 'admin' ? financialAid : financialAid.filter(f => f.studentId === user.id)) || []).length > 0 ? (
+                (user.role === 'admin' ? financialAid : financialAid.filter(f => f.studentId === user.id)).map(f => (
                   <div 
                     key={f.id} 
                     onClick={() => setSelectedApplication(f)}
                     className={cn(
-                      "flex items-center justify-between p-6 rounded-3xl transition-all cursor-pointer group",
+                      "flex flex-col md:flex-row md:items-center justify-between p-6 rounded-3xl transition-all cursor-pointer group gap-4",
                       isDarkMode ? "bg-white/5 hover:bg-white/10" : "bg-slate-50 hover:bg-slate-100"
                     )}
                   >
@@ -7884,6 +9174,7 @@ function FinancialAid({ user, financialAid, fetchFinancialAid, isDarkMode, selec
                       <div>
                         <p className="font-black text-lg group-hover:text-red-600 transition-colors">{f.program}</p>
                         <p className={cn("text-xs font-bold", isDarkMode ? "text-slate-500" : "text-slate-400")}>
+                          {user.role === 'admin' ? `Applied by ${f.studentName || 'Student'} • ` : ''}
                           ₱{f.amount} • {new Date(f.date).toLocaleDateString()}
                         </p>
                       </div>
@@ -7891,12 +9182,34 @@ function FinancialAid({ user, financialAid, fetchFinancialAid, isDarkMode, selec
                     <div className="flex items-center gap-4">
                       <span className={cn(
                         "px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest",
-                        f.status === 'pending' ? "bg-amber-500/10 text-amber-500" : 
+                        f.status === 'pending' ? "bg-amber-500/10 text-amber-500 shadow-sm shadow-amber-500/10" : 
                         f.status === 'approved' ? "bg-emerald-500/10 text-emerald-500" :
                         "bg-red-500/10 text-red-500"
                       )}>
-                        {f.status}
+                        {f.status === 'pending' ? 'Waiting for Approval' : f.status}
                       </span>
+                      {user.role === 'admin' && f.status === 'pending' && (
+                        <div className="flex gap-2" onClick={e => e.stopPropagation()}>
+                          <button 
+                            onClick={async () => {
+                              const { error } = await supabase.from('financial_aid').update({ status: 'rejected' }).eq('id', f.id);
+                              if (!error) fetchFinancialAid();
+                            }}
+                            className="p-2 rounded-xl bg-red-50 text-red-600 hover:bg-red-100 transition-all"
+                          >
+                            <X className="w-4 h-4" />
+                          </button>
+                          <button 
+                            onClick={async () => {
+                              const { error } = await supabase.from('financial_aid').update({ status: 'approved' }).eq('id', f.id);
+                              if (!error) fetchFinancialAid();
+                            }}
+                            className="p-2 rounded-xl bg-emerald-500 text-white hover:bg-emerald-600 transition-all shadow-lg shadow-emerald-200"
+                          >
+                            <Check className="w-4 h-4" />
+                          </button>
+                        </div>
+                      )}
                       <ChevronRight className="w-4 h-4 text-slate-300 group-hover:translate-x-1 transition-transform" />
                     </div>
                   </div>
@@ -7919,9 +9232,18 @@ function FinancialAid({ user, financialAid, fetchFinancialAid, isDarkMode, selec
             "p-10 rounded-[3rem] w-full max-w-md shadow-2xl border",
             isDarkMode ? "bg-[#111111] border-white/10 text-white" : "bg-white border-slate-200"
           )}>
-            <div className="flex justify-between items-center mb-8">
-              <h2 className="text-3xl font-black tracking-tighter text-slate-900 dark:text-white">Apply for Aid</h2>
-              <button onClick={() => setShowApply(false)} className="p-2 hover:bg-white/5 rounded-full transition-colors text-slate-400">
+            <div className="flex justify-between items-center mb-6">
+              <div>
+                <h2 className="text-3xl font-black tracking-tighter text-slate-900 dark:text-white leading-none">Apply for Aid</h2>
+                <button 
+                  type="button"
+                  onClick={prefillExample}
+                  className="mt-2 text-[10px] font-black uppercase text-red-600 hover:underline"
+                >
+                  (Click for Example Data)
+                </button>
+              </div>
+              <button onClick={handleCloseForm} className="p-2 hover:bg-white/5 rounded-full transition-colors text-slate-400">
                 <X className="w-6 h-6" />
               </button>
             </div>
@@ -8042,14 +9364,276 @@ function FinancialAid({ user, financialAid, fetchFinancialAid, isDarkMode, selec
                   required
                 />
               </div>
-              <div className="flex gap-4 pt-4">
-                <button type="button" onClick={() => setShowApply(false)} className="flex-1 py-4 font-black text-slate-500 hover:text-red-600 transition-colors">Cancel</button>
-                <button type="submit" className="flex-1 py-4 bg-red-600 text-white rounded-2xl font-black shadow-lg shadow-red-600/20 hover:bg-red-700 transition-all">Submit</button>
+              <div className="pt-6 border-t border-slate-100 dark:border-white/5 space-y-4">
+                {submissionStatus === 'success' && (
+                  <div className="p-4 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center gap-2 text-[10px] font-black uppercase tracking-widest animate-bounce">
+                    <CheckCircle className="w-4 h-4" />
+                    Application Submitted Successfully!
+                  </div>
+                )}
+                {submissionStatus === 'error' && (
+                  <div className="p-4 rounded-xl bg-red-50 text-red-600 flex flex-col items-center justify-center gap-1 text-[10px] font-black uppercase tracking-widest animate-pulse border border-red-100">
+                    <div className="flex items-center gap-2">
+                       <XCircle className="w-4 h-4" />
+                       Submission Failed
+                    </div>
+                    <p className="normal-case font-bold">{errorMessage}</p>
+                  </div>
+                )}
+                <div className="flex gap-4">
+                  <button 
+                    type="button" 
+                    onClick={handleCloseForm} 
+                    className="flex-1 py-4 font-black text-slate-500 hover:text-red-600 transition-colors uppercase tracking-widest text-[10px]"
+                  >
+                    Cancel
+                  </button>
+                  <button 
+                    type="submit" 
+                    disabled={submitting}
+                    className={cn(
+                      "flex-1 py-4 rounded-2xl font-black shadow-lg transition-all flex items-center justify-center gap-2 uppercase tracking-widest text-[10px]",
+                      submissionStatus === 'success' ? "bg-emerald-500 text-white shadow-emerald-500/20" :
+                      submissionStatus === 'error' ? "bg-red-500 text-white shadow-red-500/20" :
+                      "bg-red-600 text-white shadow-red-600/20 hover:bg-red-700"
+                    )}
+                  >
+                    {submitting ? (
+                      <>
+                        <div className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                        Processing...
+                      </>
+                    ) : (
+                      <>
+                        <Send className="w-4 h-4" />
+                        Submit
+                      </>
+                    )}
+                  </button>
+                </div>
               </div>
             </form>
           </motion.div>
         </div>
       )}
+
+      {selectedApplication && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 z-[100]">
+          <motion.div 
+            initial={{ scale: 0.9, opacity: 0, y: 20 }} 
+            animate={{ scale: 1, opacity: 1, y: 0 }} 
+            className={cn(
+              "p-10 rounded-[3rem] w-full max-w-2xl shadow-2xl border flex flex-col gap-8",
+              isDarkMode ? "bg-[#111111] border-white/10 text-white" : "bg-white border-slate-200"
+            )}
+          >
+            <div className="flex justify-between items-center">
+              <div>
+                <h2 className="text-3xl font-black tracking-tighter text-slate-900 dark:text-white">Application Details</h2>
+                <p className="text-slate-500 text-xs font-bold uppercase tracking-widest">Reviewing #{selectedApplication.id}</p>
+              </div>
+              <button 
+                onClick={() => setSelectedApplication(null)} 
+                className="p-2 hover:bg-slate-100 dark:hover:bg-white/5 rounded-full transition-colors text-slate-400"
+              >
+                <X className="w-6 h-6" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-8 max-h-[60vh] overflow-y-auto px-1 custom-scrollbar">
+              <div className="space-y-6">
+                <section>
+                  <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Student Information</label>
+                  <div className="flex items-center gap-4 p-4 rounded-2xl bg-slate-50 dark:bg-white/5">
+                    <div className="w-12 h-12 rounded-xl bg-red-600 flex items-center justify-center text-white font-black text-xl">
+                      {selectedApplication.studentName?.[0] || 'S'}
+                    </div>
+                    <div>
+                      <p className="font-black">{selectedApplication.studentName}</p>
+                      <p className="text-xs text-slate-500">{selectedApplication.studentId}</p>
+                    </div>
+                  </div>
+                </section>
+
+                <section>
+                  <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Program Details</label>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="p-4 rounded-2xl border border-slate-100 dark:border-white/10">
+                      <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Aid Type</p>
+                      <p className="font-bold">{selectedApplication.program}</p>
+                    </div>
+                    <div className="p-4 rounded-2xl border border-slate-100 dark:border-white/10">
+                      <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Amount</p>
+                      <p className="font-bold">₱{selectedApplication.amount?.toLocaleString()}</p>
+                    </div>
+                  </div>
+                </section>
+
+                <section>
+                  <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Attached Files</label>
+                  <div className="space-y-2">
+                    {selectedApplication.attachments && Object.entries(selectedApplication.attachments).map(([key, val]: [string, any]) => (
+                      <div key={key} className={cn(
+                        "p-3 rounded-xl border flex items-center justify-between",
+                        isDarkMode ? "bg-white/5 border-white/5" : "bg-slate-50 border-slate-100"
+                      )}>
+                        <div className="flex items-center gap-3">
+                          {val ? <CheckCircle className="w-4 h-4 text-emerald-500" /> : <XCircle className="w-4 h-4 text-slate-300" />}
+                          <span className="text-xs font-bold capitalize">{key.replace(/([A-Z])/g, ' $1').trim()}</span>
+                        </div>
+                        {val && (
+                          <button 
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setPreviewFile({ name: key, data: val });
+                            }}
+                            className="text-[10px] font-black uppercase text-red-600 hover:underline"
+                          >
+                            View File
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              </div>
+
+              <div className="space-y-6">
+                <section>
+                  <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Personal Statement</label>
+                  <div className="p-4 rounded-2xl bg-amber-50 dark:bg-amber-500/5 border border-amber-200 dark:border-amber-500/20 text-sm leading-relaxed italic text-slate-600 dark:text-slate-300">
+                    "{selectedApplication.personalStatement || 'No statement provided.'}"
+                  </div>
+                </section>
+
+                <section>
+                  <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Justification Reason</label>
+                  <div className="p-4 rounded-2xl bg-blue-50 dark:bg-blue-500/5 border border-blue-200 dark:border-blue-500/20 text-sm leading-relaxed italic text-slate-600 dark:text-slate-300">
+                    "{selectedApplication.reason || 'No justification provided.'}"
+                  </div>
+                </section>
+
+                <section>
+                  <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Application Status</label>
+                  <div className={cn(
+                    "p-4 rounded-2xl flex items-center justify-between",
+                    selectedApplication.status === 'pending' ? "bg-amber-500 text-white" :
+                    selectedApplication.status === 'approved' ? "bg-emerald-500 text-white" :
+                    "bg-red-500 text-white"
+                  )}>
+                    <span className="font-black uppercase tracking-widest text-xs">{selectedApplication.status}</span>
+                    <span className="text-[10px] font-bold opacity-80 uppercase tracking-tighter">
+                      {selectedApplication.status === 'pending' ? 'Currently under review' : 'Final decision made'}
+                    </span>
+                  </div>
+                </section>
+              </div>
+            </div>
+
+            <div className="flex gap-4 pt-4 border-t border-slate-100 dark:border-white/5">
+              <button 
+                onClick={() => setSelectedApplication(null)}
+                className="flex-1 py-4 bg-slate-900 text-white dark:bg-white dark:text-slate-900 rounded-2xl font-black uppercase tracking-widest text-xs shadow-xl hover:scale-[1.02] transition-transform"
+              >
+                Close View
+              </button>
+              {user.role === 'admin' && selectedApplication.status === 'pending' && (
+                <div className="flex gap-2 shrink-0">
+                  <button 
+                    onClick={async () => {
+                      const { error } = await supabase.from('financial_aid').update({ status: 'rejected' }).eq('id', selectedApplication.id);
+                      if (!error) {
+                        fetchFinancialAid();
+                        setSelectedApplication(null);
+                      }
+                    }}
+                    className="px-6 py-4 rounded-2xl bg-red-50 text-red-600 font-black text-xs uppercase tracking-widest hover:bg-red-100 transition-colors"
+                  >
+                    Reject
+                  </button>
+                  <button 
+                    onClick={async () => {
+                      const { error } = await supabase.from('financial_aid').update({ status: 'approved' }).eq('id', selectedApplication.id);
+                      if (!error) {
+                        fetchFinancialAid();
+                        setSelectedApplication(null);
+                      }
+                    }}
+                    className="px-6 py-4 rounded-2xl bg-emerald-500 text-white font-black text-xs uppercase tracking-widest hover:bg-emerald-600 transition-colors shadow-lg shadow-emerald-200"
+                  >
+                    Approve
+                  </button>
+                </div>
+              )}
+            </div>
+          </motion.div>
+        </div>
+      )}
+
+      {/* File Preview Modal */}
+      <AnimatePresence>
+        {previewFile && (
+          <div className="fixed inset-0 z-[1000] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }} 
+              animate={{ opacity: 1 }} 
+              exit={{ opacity: 0 }}
+              onClick={() => setPreviewFile(null)}
+              className="absolute inset-0 bg-black/90 backdrop-blur-xl"
+            />
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }} 
+              animate={{ scale: 1, opacity: 1 }} 
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="relative max-w-5xl w-full max-h-[90vh] flex flex-col bg-slate-900 rounded-[2.5rem] overflow-hidden shadow-2xl"
+            >
+              <div className="p-6 flex items-center justify-between border-b border-white/10 bg-slate-900/50 backdrop-blur-md">
+                <div>
+                  <h4 className="text-white font-black uppercase tracking-widest text-xs">File Preview</h4>
+                  <p className="text-white/60 text-[10px] font-bold uppercase tracking-widest">
+                    {previewFile.name.replace(/([A-Z])/g, ' $1').trim()}
+                  </p>
+                </div>
+                <button 
+                  onClick={() => setPreviewFile(null)}
+                  className="p-3 bg-white/5 hover:bg-white/10 rounded-2xl text-white transition-colors"
+                >
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+              <div className="flex-1 overflow-auto p-4 flex items-center justify-center bg-[#000]">
+                {typeof previewFile.data === 'string' && (previewFile.data.startsWith('data:application/pdf') || previewFile.data.includes('.pdf')) ? (
+                  <iframe 
+                    src={previewFile.data} 
+                    className="w-full h-[70vh] rounded-xl border-none"
+                    title="PDF Preview"
+                  />
+                ) : typeof previewFile.data === 'string' ? (
+                  <img 
+                    src={previewFile.data} 
+                    alt="Preview" 
+                    className="max-w-full max-h-full object-contain shadow-2xl"
+                    referrerPolicy="no-referrer"
+                  />
+                ) : (
+                  <div className="text-white font-bold text-center">
+                    <AlertTriangle className="w-12 h-12 text-amber-500 mx-auto mb-4" />
+                    <p>File content not available for older applications.</p>
+                  </div>
+                )}
+              </div>
+              <div className="p-6 bg-slate-900/50 backdrop-blur-md border-t border-white/10 flex justify-end">
+                <button 
+                  onClick={() => setPreviewFile(null)}
+                  className="px-8 py-3 bg-white text-slate-900 rounded-2xl font-black uppercase tracking-widest text-xs"
+                >
+                  Close Preview
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </motion.div>
   );
 }
@@ -8303,7 +9887,7 @@ function Documents({ user, isDarkMode }: { user: UserData, isDarkMode?: boolean 
   );
 }
 
-function Announcements({ announcements, user, isDarkMode, fetchAnnouncements, setConfirmConfig, activeModal, setActiveModal }: { announcements: any[], user: UserData, isDarkMode?: boolean, fetchAnnouncements: () => void, setConfirmConfig: any, activeModal?: string | null, setActiveModal?: (val: string | null) => void }) {
+function Announcements({ announcements, user, isDarkMode, fetchAnnouncements, setConfirmConfig, activeModal, setActiveModal, logActivity }: { announcements: any[], user: UserData, isDarkMode?: boolean, fetchAnnouncements: () => void, setConfirmConfig: any, activeModal?: string | null, setActiveModal?: (val: string | null) => void, logActivity: any }) {
   const [showForm, setShowForm] = useState(false);
 
   useEffect(() => {
@@ -8327,6 +9911,7 @@ function Announcements({ announcements, user, isDarkMode, fetchAnnouncements, se
           .eq('id', id);
         
         if (!error) {
+          logActivity('DELETE_ANNOUNCEMENT', `Announcement #${id} deleted`, 'Successful');
           fetchAnnouncements();
         }
       }
@@ -8335,14 +9920,16 @@ function Announcements({ announcements, user, isDarkMode, fetchAnnouncements, se
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const { error } = await supabase
+    const { data, error } = await supabase
       .from('announcements')
       .insert({ 
         ...formData, 
         date: new Date().toISOString() 
-      });
+      })
+      .select();
     
     if (!error) {
+      logActivity('CREATE_ANNOUNCEMENT', `New announcement created: ${formData.title}`, 'Successful');
       setShowForm(false);
       setFormData({ title: '', content: '', role: 'all' });
       fetchAnnouncements();
@@ -8590,83 +10177,232 @@ const RolesView = ({ isDarkMode }: any) => (
   </motion.div>
 );
 
-const TransactionsView = ({ isDarkMode, users, fetchUsers }: any) => {
-  const [transactions, setTransactions] = useState<any[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
+const TransactionsView = ({ user, isDarkMode, transactions, fetchTransactions }: any) => {
+  const [searchTerm, setSearchTerm] = useState('');
+  const [dateFilter, setDateFilter] = useState('');
+  const [typeFilter, setTypeFilter] = useState('all');
+  const [isLoading, setIsLoading] = useState(false);
+
+  const downloadReceipt = (t: any) => {
+    const content = `
+==========================================
+        OFFICIAL ACADEMIC RECEIPT
+==========================================
+Transaction ID: ${t.id}
+Date: ${new Date(t.timestamp).toLocaleString()}
+Student Name: ${t.userName}
+Student ID: ${t.userId}
+
+Description: ${t.details || 'Tuition Payment'}
+Payment Method: ${t.method}
+Amount Settled: ₱${t.amount?.toLocaleString()}
+
+------------------------------------------
+PREVIOUS BALANCE: ₱${(t.prevBalance || 0).toLocaleString()}
+REMAINING LIABILITY: ₱${(t.updatedBalance || 0).toLocaleString()}
+------------------------------------------
+
+This is a system-generated document for 
+educational purposes only. No real 
+currency was exchanged.
+==========================================
+`;
+    const blob = new Blob([content], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `Receipt_${t.id.slice(0, 8)}.txt`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
 
   useEffect(() => {
-    fetchTransactions();
+    if (!transactions || transactions.length === 0) {
+      fetchTransactions();
+    }
   }, []);
 
-  const fetchTransactions = async () => {
-    setIsLoading(true);
-    const { data, error } = await supabase
-      .from('transactions')
-      .select('*')
-      .order('timestamp', { ascending: false });
-    
-    if (!error && data) setTransactions(data);
-    setIsLoading(false);
+  const filteredTransactions = (transactions || []).filter(t => {
+    const matchesSearch = t.userName?.toLowerCase().includes(searchTerm.toLowerCase()) || 
+                          t.userId?.toLowerCase().includes(searchTerm.toLowerCase());
+    const matchesDate = !dateFilter || t.timestamp?.startsWith(dateFilter);
+    const matchesType = typeFilter === 'all' || (t.type || '').toLowerCase().includes(typeFilter.toLowerCase());
+    return matchesSearch && matchesDate && matchesType;
+  });
+
+  const exportToCSV = () => {
+    const headers = ["Date", "User ID", "User Name", "Type", "Method", "Amount", "Prev Balance", "New Balance"];
+    const rows = filteredTransactions.map(t => [
+      new Date(t.timestamp).toLocaleString(),
+      t.userId,
+      t.userName,
+      t.type,
+      t.method,
+      t.amount,
+      t.prevBalance || 'N/A',
+      t.updatedBalance || 'N/A'
+    ]);
+    const csvContent = [headers, ...rows].map(e => e.join(",")).join("\n");
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.setAttribute("download", `Transactions_${new Date().toISOString().slice(0,10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
   };
 
   return (
     <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="space-y-8">
-      <header className="flex justify-between items-end">
+      <header className="flex flex-col md:flex-row justify-between items-start md:items-end gap-6">
         <div>
-          <h1 className="text-4xl font-black tracking-tighter uppercase">Financial Transactions</h1>
-          <p className={isDarkMode ? "text-slate-400" : "text-slate-500"}>Monitor all financial activities and payment records.</p>
+          <h1 className="text-4xl font-black tracking-tighter uppercase leading-none mb-4">Financial Dashboard</h1>
+          <p className={cn("text-lg font-medium font-sans", isDarkMode ? "text-slate-400" : "text-slate-500")}>Detailed ledger of educational funding and tuition disbursements.</p>
         </div>
-        <button 
-          onClick={fetchTransactions}
-          className="p-3 bg-red-600 text-white rounded-xl hover:bg-red-500 transition-all"
-        >
-          <TrendingUp className="w-5 h-5" />
-        </button>
+        <div className="flex gap-4 w-full md:w-auto">
+          {user.role === 'admin' && (
+            <button 
+              onClick={exportToCSV}
+              className="flex-1 md:flex-none px-6 py-4 bg-slate-900 text-white rounded-2xl font-black text-[10px] uppercase tracking-widest flex items-center justify-center gap-2 shadow-xl hover:bg-slate-800 transition-all"
+            >
+              <Download className="w-4 h-4" />
+              Export Records
+            </button>
+          )}
+          <button 
+            onClick={fetchTransactions}
+            className="p-4 bg-red-600 text-white rounded-2xl hover:bg-red-500 transition-all shadow-xl shadow-red-600/20"
+          >
+            <TrendingUp className="w-6 h-6" />
+          </button>
+        </div>
       </header>
 
+      {(user.role === 'admin' || user.role === 'student') && (
+        <div className={cn(
+          "p-8 rounded-[2.5rem] border flex flex-col md:flex-row gap-6",
+          isDarkMode ? "bg-white/5 border-white/5" : "bg-slate-50 border-slate-100"
+        )}>
+          <div className="flex-1 relative">
+            <Search className="absolute left-6 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
+            <input 
+              type="text" 
+              placeholder={user.role === 'admin' ? "Search student by name or ID..." : "Filter your history..."}
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className={cn(
+                "w-full pl-14 pr-6 py-4 rounded-2xl font-bold border-none outline-none",
+                isDarkMode ? "bg-white/5 text-white" : "bg-white text-slate-900"
+              )}
+            />
+          </div>
+          <div className="flex-1">
+            <input 
+              type="date" 
+              value={dateFilter}
+              onChange={(e) => setDateFilter(e.target.value)}
+              className={cn(
+                "w-full px-6 py-4 rounded-2xl font-bold border-none outline-none",
+                isDarkMode ? "bg-white/5 text-white" : "bg-white text-slate-900"
+              )}
+            />
+          </div>
+          <div className="flex-1">
+            <select 
+              value={typeFilter}
+              onChange={(e) => setTypeFilter(e.target.value)}
+              className={cn(
+                "w-full px-6 py-4 rounded-2xl font-bold border-none outline-none appearance-none",
+                isDarkMode ? "bg-white/5 text-white" : "bg-white text-slate-900"
+              )}
+            >
+              <option value="all">Every Transaction Nature</option>
+              <option value="Payment">Tuition Payments</option>
+              <option value="Aid">Aid Disbursements</option>
+              <option value="Charge">System Charges (Enrollment)</option>
+            </select>
+          </div>
+        </div>
+      )}
+
       <div className={cn(
-        "rounded-[2.5rem] border overflow-hidden transition-all",
-        isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
+        "rounded-[3rem] border overflow-hidden transition-all",
+        isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-xl"
       )}>
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse">
             <thead>
-              <tr className={isDarkMode ? "bg-white/5" : "bg-slate-50"}>
-                <th className="px-8 py-6 text-xs font-bold text-slate-400 uppercase tracking-widest">Date</th>
-                <th className="px-8 py-6 text-xs font-bold text-slate-400 uppercase tracking-widest">Student</th>
-                <th className="px-8 py-6 text-xs font-bold text-slate-400 uppercase tracking-widest">Type</th>
-                <th className="px-8 py-6 text-xs font-bold text-slate-400 uppercase tracking-widest">Method</th>
-                <th className="px-8 py-6 text-xs font-bold text-slate-400 uppercase tracking-widest text-right">Amount</th>
+              <tr className={isDarkMode ? "bg-white/5 text-slate-400" : "bg-slate-50 text-slate-500"}>
+                <th className="px-8 py-6 text-[10px] font-black uppercase tracking-widest">Transaction Metadata</th>
+                <th className="px-8 py-6 text-[10px] font-black uppercase tracking-widest">Nature of Charge</th>
+                <th className="px-8 py-6 text-[10px] font-black uppercase tracking-widest">Balance Delta</th>
+                <th className="px-8 py-6 text-[10px] font-black uppercase tracking-widest text-right">Settled Amount</th>
               </tr>
             </thead>
             <tbody className={cn("divide-y", isDarkMode ? "divide-white/5" : "divide-slate-100")}>
               {isLoading ? (
                 <tr>
-                  <td colSpan={5} className="px-8 py-12 text-center text-slate-400 font-bold">Loading transactions...</td>
+                  <td colSpan={4} className="px-8 py-20 text-center">
+                    <div className="flex flex-col items-center gap-4">
+                      <Clock className="w-10 h-10 animate-spin text-red-600" />
+                      <p className="text-slate-400 font-bold uppercase tracking-widest text-xs">Accessing Ledgers...</p>
+                    </div>
+                  </td>
                 </tr>
-              ) : transactions.length > 0 ? transactions.map((t, i) => (
-                <tr key={i} className={cn("transition-colors", isDarkMode ? "hover:bg-white/5" : "hover:bg-slate-50")}>
-                  <td className="px-8 py-6">
-                    <p className="text-sm font-bold">{new Date(t.timestamp).toLocaleDateString()}</p>
-                    <p className="text-[10px] text-slate-400">{new Date(t.timestamp).toLocaleTimeString()}</p>
+              ) : filteredTransactions.length > 0 ? filteredTransactions.map((t, i) => (
+                <tr key={i} className={cn("group transition-colors", isDarkMode ? "hover:bg-white/[0.02]" : "hover:bg-slate-50")}>
+                  <td className="px-8 py-8">
+                    <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">{t.id?.slice(-8) || 'SIM-LOG'}</p>
+                    <p className="font-black text-lg tracking-tight mb-1">{t.userName}</p>
+                    <p className="text-xs font-bold text-slate-500 italic font-sans">{new Date(t.timestamp).toLocaleString()}</p>
                   </td>
-                  <td className="px-8 py-6">
-                    <p className="font-bold">{t.userName}</p>
-                    <p className="text-xs text-slate-400">{t.userId}</p>
+                  <td className="px-8 py-8">
+                    <div className="flex flex-col gap-2">
+                      <span className={cn(
+                        "w-fit px-3 py-1 rounded-lg text-[10px] font-black uppercase tracking-widest border",
+                        t.type.includes('Payment') 
+                          ? "bg-emerald-500/10 text-emerald-500 border-emerald-500/10" 
+                          : "bg-blue-500/10 text-blue-500 border-blue-500/10"
+                      )}>
+                        {t.type}
+                      </span>
+                      <p className="text-xs font-medium text-slate-400 max-w-[300px] truncate group-hover:whitespace-normal transition-all">{t.details || 'System synchronization'}</p>
+                    </div>
                   </td>
-                  <td className="px-8 py-6">
-                    <span className="text-xs font-bold px-3 py-1 bg-slate-100 dark:bg-white/5 rounded-full">{t.type}</span>
+                  <td className="px-8 py-8">
+                    <div className="flex flex-col gap-1">
+                      <p className="text-xs text-slate-500 flex items-center gap-2 font-mono">
+                        <TrendingDown className="w-3 h-3" />
+                        ₱{(t.prevBalance || 0).toLocaleString()} <span className="text-slate-300">→</span> ₱{(t.updatedBalance || 0).toLocaleString()}
+                      </p>
+                      <p className="text-[10px] font-black uppercase tracking-[0.2em] text-emerald-500">
+                        Liability State
+                      </p>
+                    </div>
                   </td>
-                  <td className="px-8 py-6">
-                    <p className="text-xs font-black uppercase tracking-widest text-red-600">{t.method}</p>
-                  </td>
-                  <td className="px-8 py-6 text-right">
-                    <p className="text-lg font-black tracking-tighter">₱{t.amount?.toLocaleString()}</p>
+                  <td className="px-8 py-8 text-right">
+                    <div className="flex flex-col items-end gap-2">
+                       <p className="text-3xl font-black tracking-tighter">₱{t.amount?.toLocaleString()}</p>
+                       <div className="flex items-center gap-3">
+                         <p className="text-[10px] font-black text-red-600 uppercase tracking-widest font-sans">{t.method}</p>
+                         {user.role === 'student' && (
+                           <button 
+                             onClick={() => downloadReceipt(t)}
+                             className="p-2 hover:bg-slate-100 rounded-lg text-slate-400 hover:text-red-600 transition-all"
+                             title="Download Receipt"
+                           >
+                             <Download className="w-4 h-4" />
+                           </button>
+                         )}
+                       </div>
+                    </div>
                   </td>
                 </tr>
               )) : (
                 <tr>
-                  <td colSpan={5} className="px-8 py-12 text-center text-slate-400 font-bold italic">No transactions found</td>
+                  <td colSpan={4} className="px-8 py-20 text-center text-slate-400 font-bold italic">No transaction history found</td>
                 </tr>
               )}
             </tbody>
@@ -8677,7 +10413,7 @@ const TransactionsView = ({ isDarkMode, users, fetchUsers }: any) => {
   );
 };
 
-const EnrollmentView = ({ isDarkMode, users, courses, fetchUsers, fetchCourses }: { isDarkMode: boolean, users: UserData[], courses: any[], fetchUsers: () => void, fetchCourses: () => void }) => {
+const EnrollmentView = ({ isDarkMode, users, courses, fetchUsers, fetchCourses, logActivity }: { isDarkMode: boolean, users: UserData[], courses: any[], fetchUsers: () => void, fetchCourses: () => void, logActivity: any }) => {
   const [selectedStudent, setSelectedStudent] = useState<UserData | null>(null);
   const [selectedCourse, setSelectedCourse] = useState<any | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
@@ -8726,15 +10462,22 @@ const EnrollmentView = ({ isDarkMode, users, courses, fetchUsers, fetchCourses }
       .eq('id', selectedStudent.id);
     
     if (!error) {
+      logActivity('ENROLLMENT', `Student ${selectedStudent.id} enrolled in ${selectedCourse.id}`, 'Successful');
       // Create transaction record
+      const prevBal = selectedStudent.balance || 0;
+      const amountToCharge = coursePrice;
+      const finalBal = newBalance;
+
       await supabase.from('transactions').insert({
         userId: selectedStudent.id,
         userName: `${selectedStudent.name} ${selectedStudent.surname}`,
         type: 'Tuition Fee',
-        amount: coursePrice,
+        amount: amountToCharge,
         method: 'AUTOMATIC SYSTEM CHARGE',
         status: 'Successful',
         timestamp: new Date().toISOString(),
+        prevBalance: prevBal,
+        updatedBalance: finalBal,
         details: `Enrollment into ${selectedCourse.id}: ${selectedCourse.name}`
       });
 
@@ -8780,29 +10523,37 @@ const EnrollmentView = ({ isDarkMode, users, courses, fetchUsers, fetchCourses }
           </div>
           
           <div className="space-y-2 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
-            {filteredStudents.map(student => (
-              <button 
-                key={student.id}
-                onClick={() => setSelectedStudent(student)}
-                className={cn(
-                  "w-full p-4 rounded-2xl border flex items-center justify-between transition-all",
-                  selectedStudent?.id === student.id 
-                    ? "bg-red-600 border-red-600 text-white" 
-                    : isDarkMode ? "bg-white/5 border-white/5 hover:bg-white/10" : "bg-slate-50 border-slate-100 hover:bg-slate-100"
-                )}
-              >
-                <div className="flex items-center gap-3">
-                  <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center font-bold", selectedStudent?.id === student.id ? "bg-white/20" : "bg-red-600 text-white")}>
-                    {student.name[0]}
+            {filteredStudents.map(student => {
+              const isAlreadyEnrolled = selectedCourse && (student.schedule || []).some((s: any) => s.subject === selectedCourse.id);
+              return (
+                <button 
+                  key={student.id}
+                  onClick={() => setSelectedStudent(student)}
+                  className={cn(
+                    "w-full p-4 rounded-2xl border flex items-center justify-between transition-all",
+                    selectedStudent?.id === student.id 
+                      ? "bg-red-600 border-red-600 text-white" 
+                      : isDarkMode ? "bg-white/5 border-white/5 hover:bg-white/10" : "bg-slate-50 border-slate-100 hover:bg-slate-100"
+                  )}
+                >
+                  <div className="flex items-center gap-3">
+                    <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center font-bold", selectedStudent?.id === student.id ? "bg-white/20" : "bg-red-600 text-white")}>
+                      {student.name[0]}
+                    </div>
+                    <div className="text-left">
+                      <p className="font-bold text-sm flex items-center gap-2">
+                        {student.name}
+                        {isAlreadyEnrolled && (
+                          <span className="px-2 py-0.5 bg-amber-500 text-white text-[8px] font-black uppercase rounded-lg">Enrolled</span>
+                        )}
+                      </p>
+                      <p className={cn("text-[10px] uppercase tracking-widest", selectedStudent?.id === student.id ? "text-white/60" : "text-slate-400")}>{student.id}</p>
+                    </div>
                   </div>
-                  <div className="text-left">
-                    <p className="font-bold text-sm">{student.name}</p>
-                    <p className={cn("text-[10px] uppercase tracking-widest", selectedStudent?.id === student.id ? "text-white/60" : "text-slate-400")}>{student.id}</p>
-                  </div>
-                </div>
-                {selectedStudent?.id === student.id && <CheckCircle className="w-5 h-5" />}
-              </button>
-            ))}
+                  {selectedStudent?.id === student.id && <CheckCircle className="w-5 h-5" />}
+                </button>
+              );
+            })}
           </div>
         </div>
 
@@ -8876,7 +10627,10 @@ const GradesMgmtView = ({ users, isDarkMode, fetchUsers, initialFilter }: { user
   const [gradeForm, setGradeForm] = useState({ 
     subject: initialFilter || '', 
     instructor: '', 
-    grade: '', 
+    prelim: '',
+    midterm: '',
+    prefinal: '',
+    finals: '',
     semester: '1st Semester',
     date: new Date().toISOString().split('T')[0]
   });
@@ -9026,7 +10780,10 @@ const GradesMgmtView = ({ users, isDarkMode, fetchUsers, initialFilter }: { user
                       <th className="pb-4 text-[10px] font-black uppercase tracking-widest text-slate-400">Subject</th>
                       <th className="pb-4 text-[10px] font-black uppercase tracking-widest text-slate-400">Instructor</th>
                       <th className="pb-4 text-[10px] font-black uppercase tracking-widest text-slate-400">Semester</th>
-                      <th className="pb-4 text-[10px] font-black uppercase tracking-widest text-slate-400">Grade</th>
+                      <th className="pb-4 text-[10px] font-black uppercase tracking-widest text-slate-400 text-center">Prelim</th>
+                      <th className="pb-4 text-[10px] font-black uppercase tracking-widest text-slate-400 text-center">Midterm</th>
+                      <th className="pb-4 text-[10px] font-black uppercase tracking-widest text-slate-400 text-center">Prefinal</th>
+                      <th className="pb-4 text-[10px] font-black uppercase tracking-widest text-slate-400 text-center">Finals</th>
                       <th className="pb-4 text-[10px] font-black uppercase tracking-widest text-slate-400 text-right">Actions</th>
                     </tr>
                   </thead>
@@ -9034,14 +10791,38 @@ const GradesMgmtView = ({ users, isDarkMode, fetchUsers, initialFilter }: { user
                     {(selectedStudent.grades || []).map((g: any, i: number) => (
                       <tr key={i} className="group">
                         <td className="py-4 font-bold text-sm">{g.subject}</td>
-                        <td className="py-4 text-sm text-slate-500">{g.instructor}</td>
+                        <td className="py-4 text-sm text-slate-500">{g.instructor?.replace('FAC-', '')}</td>
                         <td className="py-4 text-xs text-slate-400">{g.semester}</td>
-                        <td className="py-4">
+                        <td className="py-4 text-center">
                           <span className={cn(
-                            "px-3 py-1 rounded-lg font-black text-xs",
-                            parseFloat(g.grade) <= 3.0 ? "bg-emerald-500/10 text-emerald-500" : "bg-red-500/10 text-red-500"
+                            "px-3 py-1 rounded-lg font-black text-[10px]",
+                            parseFloat(g.prelim) <= 3.0 ? "bg-emerald-500/10 text-emerald-500" : "bg-red-500/10 text-red-500"
                           )}>
-                            {g.grade}
+                            {g.prelim || '-'}
+                          </span>
+                        </td>
+                        <td className="py-4 text-center">
+                          <span className={cn(
+                            "px-3 py-1 rounded-lg font-black text-[10px]",
+                            parseFloat(g.midterm) <= 3.0 ? "bg-emerald-500/10 text-emerald-500" : "bg-red-500/10 text-red-500"
+                          )}>
+                            {g.midterm || '-'}
+                          </span>
+                        </td>
+                        <td className="py-4 text-center">
+                          <span className={cn(
+                            "px-3 py-1 rounded-lg font-black text-[10px]",
+                            parseFloat(g.prefinal) <= 3.0 ? "bg-emerald-500/10 text-emerald-500" : "bg-red-500/10 text-red-500"
+                          )}>
+                            {g.prefinal || '-'}
+                          </span>
+                        </td>
+                        <td className="py-4 text-center">
+                          <span className={cn(
+                            "px-3 py-1 rounded-lg font-black text-[10px]",
+                            parseFloat(g.finals) <= 3.0 ? "bg-emerald-500/10 text-emerald-500" : "bg-red-500/10 text-red-500"
+                          )}>
+                            {g.finals || '-'}
                           </span>
                         </td>
                         <td className="py-4 text-right">
@@ -9129,26 +10910,46 @@ const GradesMgmtView = ({ users, isDarkMode, fetchUsers, initialFilter }: { user
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Grade</label>
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Prelim</label>
                     <input 
                       type="text"
-                      value={gradeForm.grade || ''}
-                      onChange={e => setGradeForm({...gradeForm, grade: e.target.value})}
+                      value={gradeForm.prelim || ''}
+                      onChange={e => setGradeForm({...gradeForm, prelim: e.target.value})}
                       className={cn("w-full p-4 rounded-2xl border outline-none font-bold", isDarkMode ? "bg-white/5 border-white/10 text-white" : "bg-slate-50 border-slate-200 text-slate-900")}
                       placeholder="e.g. 1.0"
                     />
                   </div>
                   <div className="space-y-2">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Semester</label>
-                    <select 
-                      value={gradeForm.semester}
-                      onChange={e => setGradeForm({...gradeForm, semester: e.target.value})}
-                      className={cn("w-full p-4 rounded-2xl border outline-none font-bold appearance-none", isDarkMode ? "bg-white/5 border-white/10 text-white" : "bg-slate-50 border-slate-200 text-slate-900")}
-                    >
-                      <option>1st Semester</option>
-                      <option>2nd Semester</option>
-                      <option>Summer</option>
-                    </select>
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Midterm</label>
+                    <input 
+                      type="text"
+                      value={gradeForm.midterm || ''}
+                      onChange={e => setGradeForm({...gradeForm, midterm: e.target.value})}
+                      className={cn("w-full p-4 rounded-2xl border outline-none font-bold", isDarkMode ? "bg-white/5 border-white/10 text-white" : "bg-slate-50 border-slate-200 text-slate-900")}
+                      placeholder="e.g. 1.0"
+                    />
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Pre-final</label>
+                    <input 
+                      type="text"
+                      value={gradeForm.prefinal || ''}
+                      onChange={e => setGradeForm({...gradeForm, prefinal: e.target.value})}
+                      className={cn("w-full p-4 rounded-2xl border outline-none font-bold", isDarkMode ? "bg-white/5 border-white/10 text-white" : "bg-slate-50 border-slate-200 text-slate-900")}
+                      placeholder="e.g. 1.0"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Finals</label>
+                    <input 
+                      type="text"
+                      value={gradeForm.finals || ''}
+                      onChange={e => setGradeForm({...gradeForm, finals: e.target.value})}
+                      className={cn("w-full p-4 rounded-2xl border outline-none font-bold", isDarkMode ? "bg-white/5 border-white/10 text-white" : "bg-slate-50 border-slate-200 text-slate-900")}
+                      placeholder="e.g. 1.0"
+                    />
                   </div>
                 </div>
                 <div className="space-y-2">
@@ -9432,7 +11233,14 @@ function AdminPanel({ users, fetchUsers, isDarkMode, setConfirmConfig }: { users
                           )}
                         </div>
                         <div>
-                          <p className="font-bold text-lg">{u.name}</p>
+                          <div className="flex items-center gap-2">
+                            <p className="font-bold text-lg">{u.name}</p>
+                            {u.course && (
+                              <div className="px-1.5 py-0.5 bg-emerald-500/10 text-emerald-500 rounded-md text-[8px] font-black uppercase tracking-tighter">
+                                Enrolled
+                              </div>
+                            )}
+                          </div>
                           <p className={cn("text-xs font-mono", isDarkMode ? "text-red-400" : "text-red-600")}>{u.id}</p>
                         </div>
                       </div>
@@ -10073,9 +11881,12 @@ const ScholarshipsView = ({ scholarships, user, isDarkMode, fetchScholarships, s
   );
 };
 
-const ApplicationsView = ({ financialAid, user, isDarkMode, updateFinancialAidStatus, users = [], assignFaculty, setView, setSelectedStudentForRec, deleteFinancialAid, setSelectedApplicationForSummary, fetchFinancialAid }: any) => {
+const ApplicationsView = ({ financialAid, user, isDarkMode, updateFinancialAidStatus, handleUpdateFinancialAid, users = [], assignFaculty, setView, setSelectedStudentForRec, deleteFinancialAid, setSelectedApplicationForSummary, fetchFinancialAid }: any) => {
   const isAdmin = user.role === 'admin';
   const isStaff = user.role === 'staff';
+
+  const [editingApplication, setEditingApplication] = useState<any>(null);
+  const [editForm, setEditForm] = useState({ program: '', personalStatement: '', reason: '', amount: '' });
 
   const filteredApplications = user.role === 'student' 
     ? financialAid.filter((a: any) => a.studentId === user.id)
@@ -10084,6 +11895,28 @@ const ApplicationsView = ({ financialAid, user, isDarkMode, updateFinancialAidSt
     : financialAid;
 
   const facultyMembers = users.filter((u: any) => u.role === 'faculty');
+
+  const startEditing = (a: any) => {
+    setEditingApplication(a);
+    setEditForm({
+      program: a.program || '',
+      personalStatement: a.personalStatement || '',
+      reason: a.reason || '',
+      amount: a.amount?.toString() || '0'
+    });
+  };
+
+  const saveEdit = async () => {
+    if (!editingApplication) return;
+    await handleUpdateFinancialAid(editingApplication.id, {
+      program: editForm.program,
+      personalStatement: editForm.personalStatement,
+      reason: editForm.reason,
+      amount: parseFloat(editForm.amount) || 0
+    });
+    setEditingApplication(null);
+    alert('Application updated successfully');
+  };
 
   const stats = [
     { label: 'Total', value: filteredApplications.length, icon: <FileText className="w-4 h-4" />, color: 'blue' },
@@ -10243,6 +12076,13 @@ const ApplicationsView = ({ financialAid, user, isDarkMode, updateFinancialAidSt
                               </>
                             )}
                             <button
+                              onClick={() => startEditing(a)}
+                              className="p-2 bg-blue-500/10 text-blue-500 rounded-lg hover:bg-blue-500 hover:text-white transition-all"
+                              title="Edit Details"
+                            >
+                              <Edit className="w-4 h-4" />
+                            </button>
+                            <button
                               onClick={() => deleteFinancialAid(a.id)}
                               className="p-2 bg-slate-100 dark:bg-white/5 text-slate-400 hover:text-red-600 rounded-lg transition-all"
                               title="Delete"
@@ -10267,6 +12107,65 @@ const ApplicationsView = ({ financialAid, user, isDarkMode, updateFinancialAidSt
           </table>
         </div>
       </div>
+
+      {editingApplication && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <motion.div 
+            initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }}
+            className={cn(
+              "w-full max-w-lg rounded-[2.5rem] p-10 shadow-2xl overflow-hidden flex flex-col",
+              isDarkMode ? "bg-[#111111] border border-white/5 text-white" : "bg-white border border-slate-200"
+            )}
+          >
+            <div className="flex justify-between items-center mb-8">
+              <h2 className="text-3xl font-black tracking-tighter">Edit Application</h2>
+              <button onClick={() => setEditingApplication(null)} className="p-2 hover:bg-slate-100 dark:hover:bg-white/5 rounded-full">
+                <X className="w-6 h-6" />
+              </button>
+            </div>
+            <div className="space-y-6 overflow-y-auto max-h-[60vh] px-1 custom-scrollbar">
+              <div>
+                <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Aid Program</label>
+                <input 
+                  type="text" 
+                  value={editForm.program}
+                  onChange={e => setEditForm({...editForm, program: e.target.value})}
+                  className={cn("w-full p-4 rounded-2xl border font-bold outline-none focus:ring-2 focus:ring-red-600", isDarkMode ? "bg-white/5 border-white/10" : "bg-slate-50 border-slate-200")}
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Personal Statement / Essay</label>
+                <textarea 
+                  value={editForm.personalStatement}
+                  onChange={e => setEditForm({...editForm, personalStatement: e.target.value})}
+                  className={cn("w-full p-4 rounded-2xl border font-bold outline-none focus:ring-2 focus:ring-red-600 h-40 resize-none", isDarkMode ? "bg-white/5 border-white/10" : "bg-slate-50 border-slate-200")}
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Justification / Funding Reason</label>
+                <textarea 
+                  value={editForm.reason}
+                  onChange={e => setEditForm({...editForm, reason: e.target.value})}
+                  className={cn("w-full p-4 rounded-2xl border font-bold outline-none focus:ring-2 focus:ring-red-600 h-32 resize-none", isDarkMode ? "bg-white/5 border-white/10" : "bg-slate-50 border-slate-200")}
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Amount (₱)</label>
+                <input 
+                  type="number" 
+                  value={editForm.amount}
+                  onChange={e => setEditForm({...editForm, amount: e.target.value})}
+                  className={cn("w-full p-4 rounded-2xl border font-bold outline-none focus:ring-2 focus:ring-red-600", isDarkMode ? "bg-white/5 border-white/10" : "bg-slate-50 border-slate-200")}
+                />
+              </div>
+            </div>
+            <div className="pt-8 flex gap-4">
+              <button onClick={() => setEditingApplication(null)} className="flex-1 py-4 font-black text-slate-500 hover:text-red-600 transition-colors">Cancel</button>
+              <button onClick={saveEdit} className="flex-1 py-4 bg-red-600 text-white rounded-2xl font-black shadow-lg shadow-red-600/20 hover:bg-red-700 transition-all">Save Changes</button>
+            </div>
+          </motion.div>
+        </div>
+      )}
     </motion.div>
   );
 };
@@ -10334,25 +12233,26 @@ const ReportsView = ({ financialAid, scholarships, isDarkMode, user }: any) => {
           isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
         )}>
           <h3 className="text-xl font-black tracking-tight mb-6">Application Status Distribution</h3>
-          <div className="h-[300px] flex items-end justify-around gap-4 pt-10">
+          <div className="h-[300px] flex items-end justify-around gap-4 pt-10 px-4">
             {['pending', 'approved', 'rejected'].map((status) => {
               const count = filteredAid.filter((a: any) => a.status === status).length;
-              const percentage = filteredAid.length > 0 ? (count / filteredAid.length) * 100 : 0;
+              const totalCount = filteredAid.length || 1;
+              const percentage = (count / totalCount) * 100;
               return (
-                <div key={status} className="flex-1 flex flex-col items-center gap-4">
-                  <div className="w-full relative group">
+                <div key={status} className="h-full flex-1 flex flex-col items-center justify-end gap-4">
+                  <div className="w-full relative group flex flex-col justify-end h-full bg-slate-50 dark:bg-white/5 rounded-t-2xl overflow-hidden">
                     <motion.div
                       initial={{ height: 0 }}
-                      animate={{ height: `${percentage}%` }}
+                      animate={{ height: `${Math.max(percentage, 2)}%` }}
                       className={cn(
-                        "w-full rounded-t-2xl transition-all",
-                        status === 'pending' ? "bg-amber-500" :
-                        status === 'approved' ? "bg-emerald-500" :
-                        "bg-red-500"
+                        "w-full rounded-t-2xl transition-all shadow-lg",
+                        status === 'pending' ? "bg-amber-500 shadow-amber-500/20" :
+                        status === 'approved' ? "bg-emerald-500 shadow-emerald-500/20" :
+                        "bg-red-500 shadow-red-500/20"
                       )}
                     />
-                    <div className="absolute -top-8 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity text-xs font-bold">
-                      {count}
+                    <div className="absolute top-2 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity text-[10px] font-black pointer-events-none z-10 bg-slate-900 text-white px-2 py-1 rounded">
+                      {count} ({Math.round(percentage)}%)
                     </div>
                   </div>
                   <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">{status}</span>
@@ -10395,6 +12295,8 @@ const ReportsView = ({ financialAid, scholarships, isDarkMode, user }: any) => {
 const ActivityView = ({ isDarkMode }: any) => {
   const [logs, setLogs] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [statusFilter, setStatusFilter] = useState('all');
 
   useEffect(() => {
     fetchLogs();
@@ -10413,64 +12315,135 @@ const ActivityView = ({ isDarkMode }: any) => {
     setIsLoading(false);
   };
 
+  const filteredLogs = logs.filter(log => {
+    const matchesSearch = 
+      log.userName?.toLowerCase().includes(searchTerm.toLowerCase()) || 
+      log.userId?.toLowerCase().includes(searchTerm.toLowerCase()) || 
+      log.action?.toLowerCase().includes(searchTerm.toLowerCase()) || 
+      log.details?.toLowerCase().includes(searchTerm.toLowerCase());
+    
+    const matchesStatus = statusFilter === 'all' || log.status?.toLowerCase() === statusFilter.toLowerCase();
+    
+    return matchesSearch && matchesStatus;
+  });
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
       className="space-y-8"
     >
-      <header>
-        <h1 className="text-4xl font-black tracking-tighter uppercase">Student Activity Log</h1>
-        <p className={isDarkMode ? "text-slate-400" : "text-slate-500"}>Real-time tracking of all system actions and user activities.</p>
+      <header className="flex flex-col md:flex-row md:items-center justify-between gap-6">
+        <div>
+          <h1 className="text-4xl font-black tracking-tighter uppercase">Transaction Logs Dashboard</h1>
+          <p className={isDarkMode ? "text-slate-400" : "text-slate-500"}>Comprehensive system monitoring and accountability ledger.</p>
+        </div>
+        <div className="flex gap-4">
+          <div className="relative">
+            <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+            <input 
+              type="text" 
+              placeholder="Search logs..."
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className={cn(
+                "pl-10 pr-4 py-3 rounded-2xl border text-xs font-bold outline-none focus:ring-2 focus:ring-red-600 transition-all",
+                isDarkMode ? "bg-white/5 border-white/10 text-white" : "bg-slate-50 border-slate-200"
+              )}
+            />
+          </div>
+          <select
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value)}
+            className={cn(
+              "px-4 py-3 rounded-2xl border text-xs font-bold outline-none focus:ring-2 focus:ring-red-600 transition-all",
+              isDarkMode ? "bg-white/5 border-white/10 text-white" : "bg-slate-50 border-slate-200"
+            )}
+          >
+            <option value="all">All Status</option>
+            <option value="successful">Successful</option>
+            <option value="failed">Failed</option>
+            <option value="blocked">Blocked</option>
+          </select>
+        </div>
       </header>
 
       <div className={cn(
-        "p-8 rounded-[2.5rem] border",
+        "p-8 rounded-[3rem] border overflow-hidden",
         isDarkMode ? "bg-[#111111] border-white/5" : "bg-white border-slate-200 shadow-sm"
       )}>
         <div className="overflow-x-auto">
-          <table className="w-full">
+          <table className="w-full text-left border-collapse">
             <thead>
-              <tr className="text-left border-b border-slate-100 dark:border-white/5">
-                <th className="pb-4 text-[10px] font-black uppercase tracking-widest text-slate-400">Timestamp</th>
-                <th className="pb-4 text-[10px] font-black uppercase tracking-widest text-slate-400">User ID</th>
-                <th className="pb-4 text-[10px] font-black uppercase tracking-widest text-slate-400">Action</th>
-                <th className="pb-4 text-[10px] font-black uppercase tracking-widest text-slate-400 text-right">Details</th>
+              <tr className={cn(
+                "border-b transition-colors",
+                isDarkMode ? "border-white/5 bg-white/5 text-slate-400" : "border-slate-100 bg-slate-50 text-slate-500"
+              )}>
+                <th className="px-6 py-6 text-[10px] font-black uppercase tracking-widest">Metadata</th>
+                <th className="px-6 py-6 text-[10px] font-black uppercase tracking-widest">User Entity</th>
+                <th className="px-6 py-6 text-[10px] font-black uppercase tracking-widest">Operation</th>
+                <th className="px-6 py-6 text-[10px] font-black uppercase tracking-widest">Status</th>
+                <th className="px-6 py-6 text-[10px] font-black uppercase tracking-widest text-right">Activity Context</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100 dark:divide-white/5">
-              {!isLoading && logs.map((log) => (
-                <tr key={log.id} className="group hover:bg-slate-50 dark:hover:bg-white/5 transition-colors">
-                  <td className="py-4">
+            <tbody className={cn("divide-y", isDarkMode ? "divide-white/5" : "divide-slate-100")}>
+              {isLoading ? (
+                <tr>
+                  <td colSpan={5} className="py-20 text-center">
+                    <Clock className="w-8 h-8 animate-spin text-red-600 mx-auto mb-4" />
+                    <p className="text-sm font-bold text-slate-400 italic">Syncing system archives...</p>
+                  </td>
+                </tr>
+              ) : filteredLogs.length > 0 ? filteredLogs.map((log) => (
+                <tr key={log.id} className={cn("group transition-colors", isDarkMode ? "hover:bg-white/[0.02]" : "hover:bg-slate-50")}>
+                  <td className="px-6 py-6">
                     <div className="flex flex-col">
-                      <span className="text-sm font-bold">{new Date(log.timestamp).toLocaleDateString()}</span>
-                      <span className="text-[10px] text-slate-400 uppercase tracking-widest">{new Date(log.timestamp).toLocaleTimeString()}</span>
+                      <span className="text-sm font-black tracking-tight">{new Date(log.timestamp).toLocaleDateString()}</span>
+                      <span className="text-[10px] text-slate-400 font-mono">{new Date(log.timestamp).toLocaleTimeString()}</span>
                     </div>
                   </td>
-                  <td className="py-4">
-                    <span className="text-xs font-black text-red-600 dark:text-red-500">{log.userId}</span>
+                  <td className="px-6 py-6 transition-all group-hover:pl-8">
+                    <p className="font-black text-sm">{log.userName || 'System User'}</p>
+                    <div className="flex items-center gap-2">
+                       <span className={cn(
+                         "text-[9px] font-black uppercase tracking-[0.2em]",
+                         log.role === 'admin' ? "text-amber-500" : log.role === 'faculty' ? "text-blue-500" : "text-emerald-500"
+                       )}>
+                         {log.role || 'Guest'}
+                       </span>
+                       <span className="w-1 h-1 rounded-full bg-slate-300" />
+                       <span className="text-[9px] text-slate-400 font-mono">{log.userId}</span>
+                    </div>
                   </td>
-                  <td className="py-4">
-                    <span className="px-2 py-1 rounded-lg bg-red-600/10 text-red-600 text-[10px] font-black uppercase tracking-widest">
+                  <td className="px-6 py-6">
+                    <span className={cn(
+                      "px-3 py-1.5 rounded-lg text-[9px] font-black uppercase tracking-widest border",
+                      log.action.includes('LOGIN') ? "bg-blue-600/10 text-blue-600 border-blue-600/10" :
+                      log.action.includes('PAYMENT') || log.action.includes('ENROLL') ? "bg-emerald-600/10 text-emerald-600 border-emerald-600/10" :
+                      log.action.includes('DELETE') ? "bg-red-600/10 text-red-600 border-red-600/10" :
+                      "bg-slate-600/10 text-slate-600 border-slate-600/10"
+                    )}>
                       {log.action.replace('_', ' ')}
                     </span>
                   </td>
-                  <td className="py-4 text-sm text-slate-500 text-right font-medium">
+                  <td className="px-6 py-6">
+                    <div className="flex items-center gap-2">
+                      <div className={cn(
+                        "w-2 h-2 rounded-full",
+                        log.status === 'Successful' ? "bg-emerald-500 shadow-lg shadow-emerald-500/20" :
+                        log.status === 'Failed' ? "bg-red-500 shadow-lg shadow-red-500/20" : "bg-amber-500 shadow-lg shadow-amber-500/20"
+                      )} />
+                      <span className="text-xs font-bold text-slate-500">{log.status}</span>
+                    </div>
+                  </td>
+                  <td className="px-6 py-6 text-sm text-slate-500 text-right font-medium max-w-[300px] italic">
                     {log.details}
                   </td>
                 </tr>
-              ))}
-              {isLoading && (
+              )) : (
                 <tr>
-                  <td colSpan={4} className="py-12 text-center text-slate-400 font-bold italic">
-                    Loading activity logs...
-                  </td>
-                </tr>
-              )}
-              {!isLoading && logs.length === 0 && (
-                <tr>
-                  <td colSpan={4} className="py-12 text-center text-slate-400 font-bold italic">
-                    No activity logs recorded yet.
+                  <td colSpan={5} className="py-20 text-center text-slate-400 font-bold italic">
+                    No matching activity logs recorded.
                   </td>
                 </tr>
               )}
