@@ -262,37 +262,6 @@ export default function App() {
   const [communityEvents, setCommunityEvents] = useState<any[]>([]);
   const [communityOrgs, setCommunityOrgs] = useState<any[]>([]);
 
-  // Automatic login logic for students (Session-based)
-  useEffect(() => {
-    const checkAutoLogin = async () => {
-      // If we have a saved user in localStorage, the state initializer already handles it.
-      // If we don't have a user, and we haven't manually logged out in this session,
-      // and we are on the landing/login pages, we can attempt a quick entry.
-      const savedUser = localStorage.getItem('aid_portal_user');
-      const hasLoggedOut = sessionStorage.getItem('aid_portal_manual_logout');
-      
-      if (!savedUser && !hasLoggedOut && (view === 'landing' || view === 'login')) {
-        try {
-          const { data, error } = await supabase
-            .from('users')
-            .select('*')
-            .eq('role', 'student')
-            .limit(1)
-            .single();
-          
-          if (!error && data) {
-            setUser(data);
-            setView('dashboard');
-            localStorage.setItem('aid_portal_user', JSON.stringify(data));
-          }
-        } catch (err) {
-          console.error('Auto-login error:', err);
-        }
-      }
-    };
-    checkAutoLogin();
-  }, []);
-
   // Fetch data
   useEffect(() => {
     if (user) {
@@ -310,7 +279,7 @@ export default function App() {
       fetchCommunityData();
       fetchTransactions();
     }
-  }, [user]);
+  }, [user?.id]);
 
   // Seed demo data for applications to make "Application Status Distribution" functional
   useEffect(() => {
@@ -807,9 +776,6 @@ export default function App() {
     // Clear all persistent data
     localStorage.removeItem('aid_portal_user');
     localStorage.removeItem('aid_portal_view');
-    
-    // Set a session flag to prevent immediate auto-login loop
-    sessionStorage.setItem('aid_portal_manual_logout', 'true');
     
     if (user) {
       logActivity('LOGOUT', `User ${user.name} ${user.surname} logged out`, 'Successful');
